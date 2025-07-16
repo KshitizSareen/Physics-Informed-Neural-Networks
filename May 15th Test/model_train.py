@@ -81,7 +81,7 @@ from sklearn.model_selection import train_test_split
 def get_k(k):
     return torch.nn.functional.softplus(k)
 
-def train_model(n_epochs=50000, lr=1, val_split=0.2, patience=5000):
+def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_size = 32):
 
     torch.manual_seed(42)
     df,minTemp,maxTemp = load_data()
@@ -89,8 +89,6 @@ def train_model(n_epochs=50000, lr=1, val_split=0.2, patience=5000):
 
     X_data = data[:, 0:3]
     y_data = data[:, 3]
-
-    print(df)
 
     # Train-validation split
     X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(X_data, y_data, test_size=val_split, random_state=42)
@@ -104,75 +102,60 @@ def train_model(n_epochs=50000, lr=1, val_split=0.2, patience=5000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     X_train, y_train, X_val, y_val = X_train.to(device), y_train.to(device), X_val.to(device), y_val.to(device)
 
-    # Initialize model and learnable parameter
-    k = torch.nn.Parameter(torch.tensor([1], dtype=torch.float32, requires_grad=True).to(device))
-    model = get_model().to(device)
-    optimizer = optim.Adam(list(model.parameters()) + [k], lr=lr)
-
     # Physics grid
-    N_phys = 2000
+    N_phys = 100
     x_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
     y_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
     t_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
     input_phys = torch.cat([x_phys, y_phys, t_phys], dim=1)
 
-    train_losses, val_losses, k_trace = [], [], []
+    model = get_model().to(device)
+    k = torch.nn.Parameter(torch.tensor([1], dtype=torch.float32, requires_grad=True).to(device))
+    optimizer = optim.Adam(list(model.parameters()) + [k], lr=lr)
+
 
     # Early stopping trackers
     best_val_loss = float("inf")
-    epochs_no_improve = 0
     best_model_state = True
     best_k_val = None
 
+    loss_fn = nn.MSELoss()
     best_phys_loss = float("inf")
-    epochs_no_phys_improve = 0
 
     epoch = 0
 
-    
-    for i in range(25000):
-        optimizer.zero_grad()
+    model.train()
+    for epoch in range(50):
+        avg_loss_physics = 0
+        count=0
+        permutation = torch.randperm(X_train.size()[0])
+        for i in range(0, len(X_train), batch_size):
+            T_phys = model(input_phys)
 
-        T_phys = model(input_phys)
+            dtdx = torch.autograd.grad(T_phys, x_phys, torch.ones_like(T_phys), create_graph=True)[0]
+            d2tdx2 = torch.autograd.grad(dtdx, x_phys, torch.ones_like(dtdx), create_graph=True)[0]
+            dtdy = torch.autograd.grad(T_phys, y_phys, torch.ones_like(T_phys), create_graph=True)[0]
+            d2tdy2 = torch.autograd.grad(dtdy, y_phys, torch.ones_like(dtdy), create_graph=True)[0]
+            dtdt = torch.autograd.grad(T_phys, t_phys, torch.ones_like(T_phys), create_graph=True)[0]
 
-        dtdx = torch.autograd.grad(T_phys, x_phys, torch.ones_like(T_phys), create_graph=True)[0]
-        d2tdx2 = torch.autograd.grad(dtdx, x_phys, torch.ones_like(dtdx), create_graph=True)[0]
-        dtdy = torch.autograd.grad(T_phys, y_phys, torch.ones_like(T_phys), create_graph=True)[0]
-        d2tdy2 = torch.autograd.grad(dtdy, y_phys, torch.ones_like(dtdy), create_graph=True)[0]
-        dtdt = torch.autograd.grad(T_phys, t_phys, torch.ones_like(T_phys), create_graph=True)[0]
+            residual = d2tdx2 + d2tdy2 - ((DENSITY * SPECIFIC_HEAT_CAPACITY) / k) * dtdt + (E_GEN / k)
+            loss_physics = torch.mean(residual**2)
+            avg_loss_physics+=loss_physics.item()
+            count+=1
+            indices = permutation[i:i+batch_size]
+            Xbatch = X_train[indices]
+            ybatch = y_train[indices]
 
-
-        k_val = get_k(k)
-        residual = d2tdx2 + d2tdy2 - ((DENSITY * SPECIFIC_HEAT_CAPACITY) / k_val) * dtdt + (E_GEN / k_val)
-        loss_phys = torch.mean(residual ** 2)
-
-        loss_data = torch.mean((model(X_train) - y_train) ** 2)
-        loss = loss_phys + 1e4*loss_data
-        loss.backward()
-        optimizer.step()
-
-        # Validation loss
-        with torch.no_grad():
-            print(X_val)
-            val_loss = torch.mean((model(X_val) - y_val) ** 2).item()
-            train_losses.append(loss_data.item())
-            val_losses.append(val_loss)
-            k_trace.append(k.item())
-
-        print(f"Epoch {epoch:5d} | k = {k.item()} | PDE Loss = {loss_phys.item()} | Train Loss = {loss_data.item()} | Val Loss = {val_loss}")
-        print(f"∂loss/∂k = {k.grad.item():.6f}")
-
-
-        if val_loss <best_val_loss and loss_phys.item() < best_phys_loss:
-            best_val_loss = val_loss
-            best_phys_loss = loss_phys.item()
-            best_model_state = model.state_dict()
-            best_k_val = k.clone().detach()
+            # Forward + Backward
+            y_pred = model(Xbatch)
+            loss = 1e4*loss_fn(y_pred, ybatch) + loss_physics
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
         
-        
-        epoch+=1
+        print(epoch)
 
-        if(epoch%1000==0 and epoch>0):
+        if(epoch%5==0 and epoch>0):
             tempArrayPredicted = []
             tempArrayActual = []
             maxTimestep = df["Timestamp"].max()
@@ -196,7 +179,6 @@ def train_model(n_epochs=50000, lr=1, val_split=0.2, patience=5000):
             plt.legend()
             plt.show()
 
-        break
 
     # Restore best model
     if best_model_state:
@@ -214,6 +196,7 @@ def train_model(n_epochs=50000, lr=1, val_split=0.2, patience=5000):
 
 # === Load Model ===
 def load_model():
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = get_model().to(device)
