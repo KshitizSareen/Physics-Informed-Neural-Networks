@@ -81,8 +81,10 @@ from sklearn.model_selection import train_test_split
 def get_k(k):
     return torch.nn.functional.softplus(k)
 
-def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_size = 32):
+def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size = 256):
 
+# Ensure directory exists
+    os.makedirs("plots", exist_ok=True)
     torch.manual_seed(42)
     df,minTemp,maxTemp = load_data()
     data = prepare_training_data(df,minTemp,maxTemp)
@@ -103,7 +105,7 @@ def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_siz
     X_train, y_train, X_val, y_val = X_train.to(device), y_train.to(device), X_val.to(device), y_val.to(device)
 
     # Physics grid
-    N_phys = 100
+    N_phys = 50
     x_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
     y_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
     t_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
@@ -124,8 +126,10 @@ def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_siz
 
     epoch = 0
 
+    trace_ks=[]
+
     model.train()
-    for epoch in range(50):
+    for epoch in range(n_epochs):
         avg_loss_physics = 0
         count=0
         permutation = torch.randperm(X_train.size()[0])
@@ -148,14 +152,15 @@ def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_siz
 
             # Forward + Backward
             y_pred = model(Xbatch)
-            loss = 1e4*loss_fn(y_pred, ybatch) + loss_physics
+            loss = loss_fn(y_pred, ybatch) + loss_physics
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        
+            trace_ks.append(k.item())
+
         print(epoch)
 
-        if(epoch%5==0 and epoch>0):
+        if(epoch%100==0 and epoch>0):
             tempArrayPredicted = []
             tempArrayActual = []
             maxTimestep = df["Timestamp"].max()
@@ -172,12 +177,28 @@ def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_siz
                         tempArrayActual.append(temp)
                     tpoints.append(t)
             
-            plt.figure(figsize=(6,2.5))
+
+            # Save predicted vs. actual plot
+            plt.figure(figsize=(6, 2.5))
             plt.scatter(tpoints, tempArrayActual, label="observations", alpha=0.6)
             plt.plot(tpoints, tempArrayPredicted, label="predicted", color="tab:green")
-            plt.title(f"Training step {i}")
+            plt.title(f"Training step {epoch}")
             plt.legend()
-            plt.show()
+            plt.tight_layout()
+            plt.savefig(f"plots/predicted_vs_actual_step_{epoch}.png")
+            plt.close()
+
+            # Save μ convergence plot
+            plt.figure(figsize=(8, 4))
+            plt.plot(trace_ks, label='Learned μ over epochs')
+            plt.xlabel('Epoch')
+            plt.ylabel('μ')
+            plt.title('Convergence of Learned μ')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"plots/mu_convergence_{epoch}.png")
+            plt.close()
 
 
     # Restore best model
