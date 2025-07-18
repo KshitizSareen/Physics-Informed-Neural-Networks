@@ -13,12 +13,13 @@ import sys, os
 output_path = "model.pth"
 
 # === Constants ===
-POWER_APPLIED = 0.6
-DIAMETER = 1
+POWER_APPLIED = 0.15
+DIAMETER = 0.3
 RADIUS = DIAMETER / 2
-DENSITY = 102
-SPECIFIC_HEAT_CAPACITY = 0.4
-E_GEN = POWER_APPLIED / (np.pi * RADIUS**2)
+DENSITY = 1.68
+SPECIFIC_HEAT_CAPACITY = 0.96
+TIME_STEP = 0.1
+E_GEN = (POWER_APPLIED / (np.pi * RADIUS**2))*TIME_STEP
 
 TEMP_X = ["0", "1", "2.5", "5", "10", "15"]
 TEMP_Y = ["0", "1", "2.5", "5", "15"]
@@ -27,19 +28,17 @@ Y_POSITIONS = [0, 1, 2.5, 5, 15]
 
 # === Data Loading ===
 def load_data(filepath="temperature_output.csv"):
-    column_names = ["Timestamp", "Power"] + [f"{x},{y}" for y in TEMP_Y for x in TEMP_X]
-    df = pd.read_csv(filepath, sep=",", names=column_names)
+    df = pd.read_csv(filepath)
+    all_columns = df.columns.tolist()
     minTemp = float("inf")
     maxTemp = float("-inf")
-    for x in TEMP_X:
-        neg_x = "-" + x
-        for y in TEMP_Y:
-            temp = df[f"{x},{y}"]
-            df[f"{neg_x},{y}"] = df[f"{x},{y}"]
-            if temp.min()<minTemp:
-                minTemp = temp.min()
-            if temp.max()>maxTemp:
-                maxTemp = temp.max()
+    for i in range(2,len(all_columns)):
+        column_name = all_columns[i]
+        temp_column = df[column_name]
+        if temp_column.min()<minTemp:
+            minTemp = temp_column.min()
+        if temp_column.max()>maxTemp:
+            maxTemp = temp_column.max()
             
     return df,minTemp,maxTemp
 
@@ -48,20 +47,21 @@ def prepare_training_data(df,minTemp,maxTemp):
     training_data = []
     max_time = int(df["Timestamp"].max())
     min_time = int(df["Timestamp"].min())
-    minX = -15
-    maxX = 15
+    minX = 0
+    maxX = 1
     minY = 0
-    maxY = 15
-
-    for t in range(1, max_time + 1):
-        if t == 1 or t % 10 == 0:
-            idx = df.index[df["Timestamp"] == t][0]
-            for y in Y_POSITIONS:
-                for x in X_POSITIONS:
-                    temp = df[f"{x},{y}"][idx]
-                    training_data.append([(x-minX)/(maxX-minX), (y-minY)/(maxY-minY), (t-min_time)/(max_time-min_time), (temp-minTemp)/(maxTemp-minTemp)])
-
-    return np.array(training_data)
+    maxY = 1
+    all_columns = df.columns.tolist()
+    t=1
+    for idx in range(1,len(df)):
+        for i in range(2,len(all_columns)):
+            column = all_columns[i]
+            x, y = map(float, column.strip("()").split(","))
+            if x<=maxX and y<=maxY: 
+                t = df["Timestamp"][idx]
+                temp = df[column][idx]
+                training_data.append([(x-minX)/(maxX-minX), (y-minY)/(maxY-minY), (t-min_time)/(max_time-min_time), (temp-minTemp)/(maxTemp-minTemp)])
+    return np.array(training_data),minX,maxX,minY,maxY,min_time,max_time
 
 # === Neural Network Model ===
 def get_model():
@@ -79,13 +79,15 @@ def get_model():
 def get_k(k):
     return torch.nn.functional.softplus(k)
 
-def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size = 256):
+def train_model(n_epochs=50000, lr=0.001, val_split=0.2, patience=5000,batch_size = 32,lambda_phys=1e-5):
 
 # Ensure directory exists
     os.makedirs("plots", exist_ok=True)
     torch.manual_seed(42)
     df,minTemp,maxTemp = load_data()
-    data = prepare_training_data(df,minTemp,maxTemp)
+    print(df,len(df.columns.tolist()))
+    data,minX,maxX,minY,maxY,min_time,max_time = prepare_training_data(df,minTemp,maxTemp)
+    print(data,len(data))
 
     X_data = data[:, 0:3]
     y_data = data[:, 3]
@@ -102,15 +104,24 @@ def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     X_train, y_train, X_val, y_val = X_train.to(device), y_train.to(device), X_val.to(device), y_val.to(device)
 
-    # Physics grid
-    N_phys = 50
-    x_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
-    y_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
-    t_phys = torch.linspace(0, 1, N_phys).view(-1, 1).to(device).requires_grad_(True)
+    N_phys = 20 # Using a smaller number of points for grid to manage memory
+    x_p = torch.linspace(0, 1, N_phys, device=device)
+    y_p = torch.linspace(0, 1, N_phys, device=device)
+    t_p = torch.linspace(0, 1, N_phys, device=device)
+    
+    # torch.meshgrid creates all combinations of the input points
+    X_p, Y_p, T_p = torch.meshgrid(x_p, y_p, t_p, indexing='ij')
+
+    # Flatten and combine into a single tensor of [x, y, t] coordinates
+    x_phys = X_p.flatten().view(-1, 1).requires_grad_(True)
+    y_phys = Y_p.flatten().view(-1, 1).requires_grad_(True)
+    t_phys = T_p.flatten().view(-1, 1).requires_grad_(True)
+
     input_phys = torch.cat([x_phys, y_phys, t_phys], dim=1)
+    
 
     model = get_model().to(device)
-    k = torch.nn.Parameter(torch.tensor([1], dtype=torch.float32, requires_grad=True).to(device))
+    k = torch.nn.Parameter(torch.tensor([0.015], dtype=torch.float32, requires_grad=True).to(device))
     optimizer = optim.Adam(list(model.parameters()) + [k], lr=lr)
 
 
@@ -126,11 +137,11 @@ def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size
 
     trace_ks=[]
 
-    model.train()
     for epoch in range(n_epochs):
         avg_loss_physics = 0
         count=0
         permutation = torch.randperm(X_train.size()[0])
+        model.train()
         for i in range(0, len(X_train), batch_size):
             T_phys = model(input_phys)
 
@@ -150,7 +161,7 @@ def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size
 
             # Forward + Backward
             y_pred = model(Xbatch)
-            loss = loss_fn(y_pred, ybatch) + loss_physics
+            loss = loss_fn(y_pred, ybatch) + (lambda_phys* loss_physics)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -161,20 +172,18 @@ def train_model(n_epochs=50000, lr=0.01, val_split=0.2, patience=5000,batch_size
         if(epoch%100==0 and epoch>0):
             tempArrayPredicted = []
             tempArrayActual = []
-            maxTimestep = df["Timestamp"].max()
             tpoints=[]
-            for t in range(1,maxTimestep+1):
-                if t == 1 or t % 10 == 0:
-                    input_tensor = torch.tensor([[(0-min(X_POSITIONS))/(max(X_POSITIONS)-min(X_POSITIONS)), (0-min(Y_POSITIONS))/(max(Y_POSITIONS)-min(Y_POSITIONS)), (t-df["Timestamp"].min())/(df["Timestamp"].max()-df["Timestamp"].min())]], dtype=torch.float32).to(device)
-                    with torch.no_grad():
-                        prediction = model(input_tensor).item()
-                        prediction = prediction*(maxTemp-minTemp)+minTemp
-                        tempArrayPredicted.append(prediction)
-                        idx = df.index[df["Timestamp"] == t][0]
-                        temp = df[f"{0},{0}"][idx]
-                        tempArrayActual.append(temp)
-                    tpoints.append(t)
-            
+            t=1
+            for idx in range(1,len(df)):
+                t = df["Timestamp"][idx]
+                input_tensor = torch.tensor([[(0-minX)/(maxX-minX), (0-minY)/(maxY-minY), (t-min_time)/(max_time-min_time)]], dtype=torch.float32).to(device)
+                with torch.no_grad():
+                    prediction = model(input_tensor).item()
+                    prediction = prediction*(maxTemp-minTemp)+minTemp
+                    tempArrayPredicted.append(prediction)
+                    temp = df["(0.0,0.0)"][idx]
+                    tempArrayActual.append(temp)
+                tpoints.append(t)
 
             # Save predicted vs. actual plot
             plt.figure(figsize=(6, 2.5))
