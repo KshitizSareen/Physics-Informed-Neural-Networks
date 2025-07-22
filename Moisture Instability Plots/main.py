@@ -5,6 +5,7 @@ import torch
 import os
 from NN import train_model,SimpleNN
 import numpy as np
+from sklearn.linear_model import RANSACRegressor, LinearRegression
 
 # Load and prepare data
 df = pd.read_csv("data.csv").dropna()
@@ -61,6 +62,94 @@ def load_or_train_model(X, y, col_name):
     return y_pred, dy_dx, X_mean, X_std, y_mean, y_std
 
 
+def linear_regression(x, y):
+    if x.size == 0:
+        return 0.0, 0.0
+
+    n = x.size
+    sum_x = np.sum(x)
+    sum_y = np.sum(y)
+    sum_xy = np.dot(x, y)
+    sum_xx = np.dot(x, x)
+
+    denominator = n * sum_xx - sum_x**2
+    if denominator == 0:
+        return 0.0, 0.0
+
+    slope = (n * sum_xy - sum_x * sum_y) / denominator
+    intercept = (sum_y - slope * sum_x) / n
+    return slope, intercept
+
+def calculate_cd(x, y, slope, intercept):
+    if x.size == 0:
+        return 0.0
+
+    predicted_y = slope * x + intercept
+    ss_res = np.sum((y - predicted_y)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+
+    return 0.0 if ss_tot == 0 else 1.0 - ss_res / ss_tot
+
+def data_fitting_ransac(x_values, y_values, threshold=0.001, iterations=100):
+    x_values = np.asarray(x_values, dtype=np.float32)
+    y_values = np.asarray(y_values, dtype=np.float32)
+    
+    if x_values.size != y_values.size or x_values.size < 2:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    n = x_values.size
+    best_slope = 0.0
+    best_intercept = 0.0
+    best_cd = 0.0
+    best_inlier_indices = None
+    best_inlier_count = -1
+
+    for _ in range(iterations):
+        # 1. Randomly sample 2 points
+        sample_indices = np.random.choice(n, 2, replace=False)
+        x_sample = x_values[sample_indices]
+        y_sample = y_values[sample_indices]
+
+        # Avoid vertical lines
+        if x_sample[0] == x_sample[1]:
+            continue
+
+        # 2. Fit a line to the sample
+        slope = (y_sample[1] - y_sample[0]) / (x_sample[1] - x_sample[0])
+        intercept = y_sample[0] - slope * x_sample[0]
+
+        # 3. Find all inliers in the full dataset
+        predicted = slope * x_values + intercept
+        residuals = np.abs(y_values - predicted)
+        inlier_indices = np.where(residuals < threshold)[0]
+        inlier_count = len(inlier_indices)
+        
+        # 4. Check if this is the best model so far
+        if inlier_count > best_inlier_count:
+            best_inlier_count = inlier_count
+            best_inlier_indices = inlier_indices
+    
+    # 5. Refit the model using all inliers from the best model found
+    if best_inlier_count > 1:
+        x_inliers = x_values[best_inlier_indices]
+        y_inliers = y_values[best_inlier_indices]
+
+        # Use the robust linear regression on all found inliers
+        refined_slope, refined_intercept = linear_regression(x_inliers, y_inliers)
+        cd = calculate_cd(x_inliers, y_inliers, refined_slope, refined_intercept)
+        
+        # The start/end x values are now from the inliers
+        start_x = np.min(x_inliers)
+        end_x = np.max(x_inliers)
+        
+        return refined_slope, refined_intercept, cd, start_x, end_x
+    else:
+        # Failed to find a model
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+
+
+
 # --- X input is timestamp ---
 X = df['Timestamp'].values.flatten()
 
@@ -110,15 +199,17 @@ def sliding_gradient_change(df, columns):
 
         for i in range(0, len(df)):
             # Linear regression: gradient = slope
-            grad = results[col]['dy_dx'][i]
+            y_std = results[col]['y_std']
+            x_std = results[col]['X_std']
+            grad = results[col]['dy_dx'][i] / (y_std*x_std)
 
             # Compare with previous window
             if prev_grad is not None:
                 rel_change = abs((grad - prev_grad) / (prev_grad + 1e-8))
+                print(rel_change)
                 if rel_change >= THRESHOLD:
                     timestamp = X[i]
                     y_mean = results[col]['y_mean']
-                    y_std = results[col]['y_std']
                     temperature = (results[col]['pred'][i]*y_std)+y_mean
                     markers.append({
                         'Timestamp': timestamp,
@@ -132,188 +223,108 @@ def sliding_gradient_change(df, columns):
 
     return pd.DataFrame(markers)
 
-# ---- Build model prediction DataFrame for y_columns ----
-pred_df_y = pd.DataFrame({'Timestamp': df['Timestamp']})
+def add_analysis_traces(fig, df, results, column_name, color, label):
+    """
+    Calculates and adds analysis traces (markers, regression lines) for a single column to a figure.
+    """
+    marker_df = sliding_gradient_change(df, [column_name])
 
-for col in y_columns:
-    if col in results:
-        y_mean = results[col]['y_mean']
-        y_std = results[col]['y_std']
-        pred_df_y[col] = (results[col]['pred']*y_std)+y_mean
-    else:
-        print(f"Prediction for {col} not found in results.")
+    if marker_df.empty:
+        return
 
-# ---- Y Data ----
-df_y_pred = pred_df_y.melt(id_vars='Timestamp', var_name='Sensor', value_name='Temperature')
-marker_df_y = sliding_gradient_change(df, y_columns)
-
-# ---- Plot predictions instead of raw data ----
-fig_y = px.line(df_y_pred, x='Timestamp', y='Temperature', color='Sensor', title='Y Data Over Time')
-
-
-if not marker_df_y.empty:
-    for _, row in marker_df_y.iterrows():
+    prevTimestep = 1
+    is_first_marker = True
+    for _, row in marker_df.iterrows():
         timestamp = row['Timestamp']
         sensor = row['Sensor']
         try:
             result = results[sensor]
-            idx = df[df['Timestamp'] == timestamp].index[0]
+            idx_list = df[df['Timestamp'] == timestamp].index
+            if not idx_list.any(): continue
+            idx = idx_list[0]
 
             x0 = timestamp
-            y0 = result['pred'][idx]
-            slope = result['dy_dx'][idx]
+            y0 = df[sensor].iloc[idx]
 
-            # Normalization params
-            X_mean = result['X_mean']
-            X_std = result['X_std']
-            y_mean = result['y_mean']
-            y_std = result['y_std']
+            x_range = df['Timestamp'][(df['Timestamp'] >= prevTimestep) & (df['Timestamp'] <= timestamp) & (df['Timestamp'] % 10 == 0)].values
+            x_range = x_range[x_range > 0]
+            if len(x_range) < 2: continue
 
-            logrange = 0
+            df_range = df[df['Timestamp'].isin(x_range)]
+            y_values = df_range[sensor].values
+            x_range_log = np.log(x_range)
 
-                # Define small local window around x0
-            # Define small local window around x0
-            if timestamp<=10:
-                logrange=1
-            elif timestamp<=100:
-                logrange=10
-            elif timestamp<=1000:
-                logrange=100
-            elif timestamp<=10000:
-                logrange=1000
-            elif timestamp<=100000:
-                logrange=10000
-            x_range = df['Timestamp'][(df['Timestamp'] >= x0 - logrange) & (df['Timestamp'] <= x0 + logrange)].values
+            best_slope, best_intercept, _, _, _ = data_fitting_ransac(x_values=x_range_log, y_values=y_values)
+            if best_slope == 0 and best_intercept == 0: continue
+            
+            t1 = best_slope * np.log(100) + best_intercept
+            t2 = best_slope * np.log(1000) + best_intercept
+            TR = 4 * np.pi * (t2 - t1) / (2.303 * 0.4)
+            y_best_fit = x_range_log * best_slope + best_intercept
 
+            fig.add_trace(go.Scatter(
+                x=x_range,
+                y=y_best_fit,
+                mode='lines',
+                line=dict(color=color, dash='dot'),
+                name=f'Fit {sensor}',
+                showlegend=False
+            ))
 
-            # Normalize x_range
-            x_range_norm = (x_range - X_mean) / X_std
-
-            intercept = y0 - slope * ((timestamp - X_mean)/X_std)
-
-            # Compute tangent line in normalized space, then unnormalize output
-            y_tangent = slope * (x_range_norm) + intercept
-            y_tangent = y_tangent * y_std + y_mean  # unnormalize prediction
-
-
-
-            # Add marker at point of tangency
-            fig_y.add_trace(go.Scatter(
-                x=[x0],
-                y=[(y0*y_std)+y_mean],
+            fig.add_trace(go.Scatter(
+                x=[x0], y=[y0],
                 mode='markers',
-                marker=dict(size=8, color='black', symbol='x'),
-                name='Gradient Shift ≥ 5% (Y)',
-                customdata=[[sensor, row['CurrentGrad'], row['PrevGrad']]],
+                marker=dict(size=10, color=color, symbol='x'),
+                name=label,
+                customdata=[[sensor, row['CurrentGrad'], row['PrevGrad'], TR]],
                 hovertemplate=(
                     "Timestamp: %{x}<br>"
                     "Temperature: %{y:.2f}°C<br>"
                     "Sensor: %{customdata[0]}<br>"
-                    "CurrentGrad: %{customdata[1]}<br>"
-                    "PrevGrad: %{customdata[2]}<br>"
+                    "CurrentGrad: %{customdata[1]:.3f}<br>"
+                    "PrevGrad: %{customdata[2]:.3f}<br>"
+                    "TR: %{customdata[3]:.3f}"
                 ),
-                showlegend=False
+                showlegend=is_first_marker
             ))
+            is_first_marker = False
+            prevTimestep = timestamp
         except Exception as e:
-            print(f"Could not compute tangent for {sensor} at {timestamp}: {e}")
+            print(f"Could not compute regression for {sensor} at {timestamp}: {e}")
 
-fig_y.update_layout(
-    yaxis_type="linear",  # or "linear"
-    xaxis_type="log",  # if you want log-time
-    template="plotly_white"
-)
+# Main loop to create a separate plot for each x/y pair
+for x_col, y_col in zip(x_columns, y_columns):
+    fig = go.Figure()
 
-fig_y.show()
+    # Add main data traces
+    fig.add_trace(go.Scatter(
+        x=df['Timestamp'], y=df[x_col], mode='lines',
+        name=x_col, line=dict(color='royalblue')
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['Timestamp'], y=df[y_col], mode='lines',
+        name=y_col, line=dict(color='firebrick')
+    ))
 
-# ---- Build model prediction DataFrame for y_columns ----
-pred_df_x = pd.DataFrame({'Timestamp': df['Timestamp']})
+    # Add analysis traces for the x-column
+    add_analysis_traces(fig, df, results, x_col, color='darkblue', label=f'Shift ({x_col})')
 
-for col in x_columns:
-    if col in results:
-        y_mean = results[col]['y_mean']
-        y_std = results[col]['y_std']
-        pred_df_x[col] = (results[col]['pred']*y_std)+y_mean
-    else:
-        print(f"Prediction for {col} not found in results.")
+    # Add analysis traces for the y-column
+    if x_col != y_col: # Avoid duplicating analysis if x_col is the same as y_col (like x0, y0)
+        add_analysis_traces(fig, df, results, y_col, color='darkred', label=f'Shift ({y_col})')
 
-# ---- Y Data ----
-df_x_pred = pred_df_x.melt(id_vars='Timestamp', var_name='Sensor', value_name='Temperature')
-marker_df_x = sliding_gradient_change(df, x_columns)
-
-# ---- Plot predictions instead of raw data ----
-fig_x = px.line(df_x_pred, x='Timestamp', y='Temperature', color='Sensor', title='X Data Over Time')
-
-if not marker_df_x.empty:
-    for _, row in marker_df_x.iterrows():
-        timestamp = row['Timestamp']
-        sensor = row['Sensor']
-        try:
-            result = results[sensor]
-            idx = df[df['Timestamp'] == timestamp].index[0]
-
-            x0 = timestamp
-            y0 = result['pred'][idx]
-            slope = result['dy_dx'][idx]
-
-            # Normalization params
-            X_mean = result['X_mean']
-            X_std = result['X_std']
-            y_mean = result['y_mean']
-            y_std = result['y_std']
-
-            intercept = y0 - slope * ((timestamp - X_mean)/X_std)
-            # Compute tangent line in normalized space, then unnormalize output
-            y_tangent = slope * (((X-X_mean)/X_std)) + intercept
-            y_tangent = (y_tangent * y_std) + y_mean  # unnormalize prediction
-            slope = (y_tangent[-1]-y_tangent[0])/(np.log(X[-1])-np.log(X[0]))
-            t1 = (slope * np.log(1000)) + y_tangent[0]
-            t2 = (slope * np.log(100)) + y_tangent[0]
-            tr = ((4 * np.pi * (t1 - t2) )/ (2.303* 0.4))
-            print(slope,intercept* y_std + y_mean,y_tangent[0])
-
-            # Add marker at point of tangency
-            fig_x.add_trace(go.Scatter(
-                x=[x0],
-                y=[(y0 * y_std) + y_mean],
-                mode='markers',
-                marker=dict(size=8, color='black', symbol='x'),
-                name='Gradient Shift ≥ 5% (X)',
-                customdata=[[sensor,tr]],
-                hovertemplate=(
-                    "Timestamp: %{x}<br>"
-                    "Temperature: %{y:.2f}°C<br>"
-                    "Sensor: %{customdata[0]}<br>"
-                    "TR: %{customdata[1]}<br>"
-                ),
-                showlegend=False
-            ))
-        except Exception as e:
-            print(f"Could not compute tangent for {sensor} at {timestamp}: {e}")
-
-fig_x.update_layout(
-    yaxis_type="linear",  # or "linear"
-    xaxis_type="linear",  # if you want log-time
-    template="plotly_white"
-)
-
-fig_x.show()
-
-"""
-# ---- Locate index of timestamp ----
-timestamp_to_check = 500
-index_array = df[df['Timestamp'] == timestamp_to_check].index
-if len(index_array) == 0:
-    raise ValueError("Timestamp not found.")
-index = index_array[0]
-
-# ---- Extract values ----
-gradient_at_t_normalized = model_derivative.flatten()[index]
-# Unnormalize dy/dx
-gradient_at_t = gradient_at_t_normalized
-
-
-y_at_timestep = y_pred.flatten()[index]
-
-intercept = y_at_timestep - gradient_at_t * ((timestamp_to_check - X_mean)/X_std)
-y_tangent = gradient_at_t * ((X - X_mean)/X_std) + intercept
-"""
+    # Update layout and show the plot for the current pair
+    fig.update_layout(
+        title=f'Analysis for {x_col} and {y_col} vs. Time',
+        xaxis_title="Timestamp (log scale)",
+        yaxis_title="Value",
+        yaxis_type="linear",
+        xaxis_type="log",
+        template="plotly_white",
+        legend_title="Sensor",
+        yaxis=dict(
+            range=[20, 70],  # Set the y-axis range from 0 to 70
+            type="linear"
+        ),
+    )
+    fig.show()
