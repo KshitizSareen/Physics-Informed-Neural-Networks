@@ -16,8 +16,8 @@ y_columns = ['y0','y3','y6','y9','y12','y15','y18','y23']
 
 X = df['Timestamp'].values.flatten()
 
-THRESHOLD = 0.05
-
+THRESHOLD = 0.25
+POWER = 0.4
 # Storage
 results = {}
 
@@ -150,16 +150,14 @@ def data_fitting_ransac(x_values, y_values, threshold=0.001, iterations=100):
 
 
 
-# --- X input is timestamp ---
 X = df['Timestamp'].values.flatten()
 
-# --- Process x_columns ---
-for x_col in x_columns:
-    print(f"Processing model for x_col = {x_col}")
-    y = df[x_col].values.flatten()
+def process_column(column_name: str):
+    print(f"Processing model for column = {column_name}")
+    y = df[column_name].values.flatten()
     try:
-        y_pred, dy_dx, X_mean, X_std, y_mean, y_std = load_or_train_model(X, y, x_col)
-        results[x_col] = {
+        y_pred, dy_dx, X_mean, X_std, y_mean, y_std = load_or_train_model(X, y, column_name)
+        results[column_name] = {
             'pred': y_pred.flatten(),
             'dy_dx': dy_dx.flatten(),
             'X_mean': X_mean,
@@ -168,24 +166,11 @@ for x_col in x_columns:
             'y_std': y_std
         }
     except Exception as e:
-        print(f"Failed on x_col={x_col}: {e}")
+        print(f"Failed on {column_name}: {e}")
 
-# --- Process y_columns ---
-for y_col in y_columns:
-    print(f"Processing model for y_col = {y_col}")
-    y = df[y_col].values.flatten()
-    try:
-        y_pred, dy_dx, X_mean, X_std, y_mean, y_std = load_or_train_model(X, y, y_col)
-        results[y_col] = {
-            'pred': y_pred.flatten(),
-            'dy_dx': dy_dx.flatten(),
-            'X_mean': X_mean,
-            'X_std': X_std,
-            'y_mean': y_mean,
-            'y_std': y_std
-        }
-    except Exception as e:
-        print(f"Failed on y_col={y_col}: {e}")
+# --- Process all columns ---
+for col in x_columns + y_columns:
+    process_column(col)
 
 
 
@@ -201,12 +186,11 @@ def sliding_gradient_change(df, columns):
             # Linear regression: gradient = slope
             y_std = results[col]['y_std']
             x_std = results[col]['X_std']
-            grad = results[col]['dy_dx'][i] / (y_std*x_std)
+            grad = (results[col]['dy_dx'][i] * y_std) / (x_std)
 
             # Compare with previous window
             if prev_grad is not None:
                 rel_change = abs((grad - prev_grad) / (prev_grad + 1e-8))
-                print(rel_change)
                 if rel_change >= THRESHOLD:
                     timestamp = X[i]
                     y_mean = results[col]['y_mean']
@@ -223,9 +207,10 @@ def sliding_gradient_change(df, columns):
 
     return pd.DataFrame(markers)
 
-def add_analysis_traces(fig, df, results, column_name, color, label):
+def add_analysis_traces(fig, df, results, column_name, color, label, tr_table_data):
     """
     Calculates and adds analysis traces (markers, regression lines) for a single column to a figure.
+    Populates tr_table_data with (Timestamp, Sensor, TR) values.
     """
     marker_df = sliding_gradient_change(df, [column_name])
 
@@ -240,7 +225,8 @@ def add_analysis_traces(fig, df, results, column_name, color, label):
         try:
             result = results[sensor]
             idx_list = df[df['Timestamp'] == timestamp].index
-            if not idx_list.any(): continue
+            if not idx_list.any():
+                continue
             idx = idx_list[0]
 
             x0 = timestamp
@@ -248,18 +234,24 @@ def add_analysis_traces(fig, df, results, column_name, color, label):
 
             x_range = df['Timestamp'][(df['Timestamp'] >= prevTimestep) & (df['Timestamp'] <= timestamp) & (df['Timestamp'] % 10 == 0)].values
             x_range = x_range[x_range > 0]
-            if len(x_range) < 2: continue
+            if len(x_range) < 2:
+                continue
 
             df_range = df[df['Timestamp'].isin(x_range)]
             y_values = df_range[sensor].values
             x_range_log = np.log(x_range)
 
             best_slope, best_intercept, _, _, _ = data_fitting_ransac(x_values=x_range_log, y_values=y_values)
-            if best_slope == 0 and best_intercept == 0: continue
-            
+            if best_slope == 0 and best_intercept == 0:
+                continue
+
             t1 = best_slope * np.log(100) + best_intercept
             t2 = best_slope * np.log(1000) + best_intercept
-            TR = 4 * np.pi * (t2 - t1) / (2.303 * 0.4)
+            TR = 4 * np.pi * (t2 - t1) / (2.303 * POWER)
+
+            # Append to TR table
+            tr_table_data.append((f"{sensor}", f"{timestamp}", f"{TR:.3f}"))
+
             y_best_fit = x_range_log * best_slope + best_intercept
 
             fig.add_trace(go.Scatter(
@@ -287,44 +279,59 @@ def add_analysis_traces(fig, df, results, column_name, color, label):
                 ),
                 showlegend=is_first_marker
             ))
+
             is_first_marker = False
             prevTimestep = timestamp
         except Exception as e:
             print(f"Could not compute regression for {sensor} at {timestamp}: {e}")
 
-# Main loop to create a separate plot for each x/y pair
+from plotly.subplots import make_subplots
+
 for x_col, y_col in zip(x_columns, y_columns):
-    fig = go.Figure()
+    fig = make_subplots(
+    rows=1, cols=2,
+    horizontal_spacing=0.03,
+    specs=[[{"type": "scatter"},{"type": "table"}]],column_widths=[0.7, 0.3]
+)
+    tr_table_data = []
 
     # Add main data traces
     fig.add_trace(go.Scatter(
         x=df['Timestamp'], y=df[x_col], mode='lines',
         name=x_col, line=dict(color='royalblue')
-    ))
+    ),row=1,col=1)
     fig.add_trace(go.Scatter(
         x=df['Timestamp'], y=df[y_col], mode='lines',
         name=y_col, line=dict(color='firebrick')
-    ))
+    ),row=1,col=1)
 
     # Add analysis traces for the x-column
-    add_analysis_traces(fig, df, results, x_col, color='darkblue', label=f'Shift ({x_col})')
+    add_analysis_traces(fig, df, results, x_col, color='darkblue', label=f'Shift ({x_col})', tr_table_data=tr_table_data)
 
     # Add analysis traces for the y-column
-    if x_col != y_col: # Avoid duplicating analysis if x_col is the same as y_col (like x0, y0)
-        add_analysis_traces(fig, df, results, y_col, color='darkred', label=f'Shift ({y_col})')
+    if x_col != y_col:
+        add_analysis_traces(fig, df, results, y_col, color='darkred', label=f'Shift ({y_col})', tr_table_data=tr_table_data)
 
-    # Update layout and show the plot for the current pair
+    # Add TR Table as a side panel
+    if tr_table_data:
+        fig.add_trace(go.Table(
+            header=dict(values=["Sensor", "Timestamp", "TR"],
+                        fill_color='lightgrey', align='left'),
+            cells=dict(values=list(zip(*tr_table_data)),
+                       fill_color='white', align='left'),
+            name="TR Info"
+        ),row=1, col=2)
+
+    # Update layout
     fig.update_layout(
         title=f'Analysis for {x_col} and {y_col} vs. Time',
         xaxis_title="Timestamp (log scale)",
         yaxis_title="Value",
-        yaxis_type="linear",
         xaxis_type="log",
+        yaxis_type="linear",
+        yaxis=dict(range=[20, 70]),
         template="plotly_white",
         legend_title="Sensor",
-        yaxis=dict(
-            range=[20, 70],  # Set the y-axis range from 0 to 70
-            type="linear"
-        ),
     )
+
     fig.show()
