@@ -4,6 +4,9 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from torch import nn
+from torch import autograd
+import time
+from torch.utils.data import DataLoader, TensorDataset
 
 data = scipy.io.loadmat('Burgers.mat')
 
@@ -15,7 +18,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 steps=20000
-lr=1e-1
+lr=0.1
 layers = np.array([2,20,20,20,20,20,20,20,20,1]) #8 hidden layers
 N_u = 100 #Total number of data points for 'u'
 N_f = 10_000 #Total number of collocation points 
@@ -80,6 +83,7 @@ idx = np.random.choice(total_points,N_u,replace=False)
 
 U_true = usol.flatten('F')[:,None]
 
+print(U_true)
 X_train_Nu = X_true[idx]
 U_train_Nu = U_true[idx]
 
@@ -90,6 +94,9 @@ U_train_Nu = torch.from_numpy(U_train_Nu).float().to(device)
 
 X_true = torch.from_numpy(X_true).float().to(device)
 U_true = torch.from_numpy(U_true).float().to(device)
+
+f_hat = torch.zeros(X_train_Nu.shape[0],1).to(device)
+     
 
 
 #  Deep Neural Network
@@ -137,12 +144,14 @@ class DNN(nn.Module):
         return a
     
 
-lambda1 = 2.0
+lambda1=2.0
+lambda2=0.2
 
-lambda2 = 0.02
 
 class FCN():
     def __init__(self,layers):
+
+        self.iter=0
         'Call our DNN'
         self.dnn = DNN(layers).to(device)
         'Initialize our parameters'
@@ -179,9 +188,16 @@ class FCN():
         
         u = self.dnn(g)
                 
-        u_x_t = autograd.grad(u,g,torch.ones([X_train_Nu.shape[0], 1]).to(device), retain_graph=True, create_graph=True)[0]
+        u_x_t = autograd.grad(u,g,torch.ones([X_train_Nu.shape[0], 1]).to(device), retain_graph=True, create_graph=True)
+
+
+        u_x_t=u_x_t[0]
+
+        print(u_x_t.shape)
                                 
         u_xx_tt = autograd.grad(u_x_t,g,torch.ones(X_train_Nu.shape).to(device), create_graph=True)[0]
+
+        print(u_xx_tt.shape)
                                                             
         u_x = u_x_t[:,[0]]
         
@@ -244,4 +260,33 @@ class FCN():
         u_pred = np.reshape(u_pred,(x.shape[0],t.shape[0]),order='F')
                 
         return error_vec, u_pred
+
+
+layers = np.array([2,20,20,20,20,20,20,20,20,1])
+PINN = FCN(layers)
+
+params = list(PINN.dnn.parameters())
+'L-BFGS Optimizer'
+optimizer = torch.optim.LBFGS(params, lr, 
+                              max_iter = 1, 
+                              max_eval = None, 
+                              tolerance_grad = 1e-11, 
+                              tolerance_change = 1e-11, 
+                              history_size = 100, 
+                              line_search_fn = 'strong_wolfe')
+
+start_time = time.time()
+
+optimizer.step(PINN.closure)
+    
+    
+elapsed = time.time() - start_time                
+print('Training time: %.2f' % (elapsed))
+
+
+''' Model Accuracy ''' 
+error_vec, u_pred = PINN.test()
+
+print('Test Error: %.5f'  % (error_vec))
+
 
