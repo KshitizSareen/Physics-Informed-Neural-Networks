@@ -14,7 +14,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 steps=20000
-lr=0.1
 
 # === Constants ===
 POWER_APPLIED = 0.15
@@ -27,100 +26,92 @@ Q = 2.192
 # === Data Loading ===
 def load_data(filepath="temperature_output.csv"):
     df = pd.read_csv(filepath)
-    all_columns = df.columns.tolist()
-    minTemp = float("inf")
-    maxTemp = float("-inf")
-    for i in range(2,len(all_columns)):
-        column_name = all_columns[i]
-        temp_column = df[column_name]
-        if temp_column.min()<minTemp:
-            minTemp = temp_column.min()
-        if temp_column.max()>maxTemp:
-            maxTemp = temp_column.max()
             
-    return df,minTemp,maxTemp
+    return df
 
 # === Prepare Training Data ===
 
-def prepare_training_data(df, minTemp, maxTemp):
+def prepare_training_data(df):
     training_data = []
     
-    # Properly compute min/max without casting
-    min_time = df["Timestamp"].min()
-    max_time = df["Timestamp"].max()
-    
-    # Spatial bounds
-    minX, maxX = 0.0, 1.0
-    minY, maxY = 0.0, 1.0
     
     xValues = set()
     yValues = set()
     tValues = set()
-    
+    tempValues = set()
     all_columns = df.columns.tolist()
 
     all_coords = []
     all_temps = []
-    
     for idx in range(len(df)):
         t_raw = df["Timestamp"].iloc[idx]
         for i in range(2, len(all_columns)):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
-            if x <= maxX and y <= maxY and t_raw <= max_time:
-                # Normalize each value
-                norm_x = (x - minX) / (maxX - minX)
-                norm_y = (y - minY) / (maxY - minY)
-                norm_t = (t_raw - min_time) / (max_time - min_time)
-                norm_temp = (temp -minTemp) / (maxTemp-minTemp)
 
-                training_data.append([norm_x, norm_y, norm_t, norm_temp])
-                
-                xValues.add(norm_x)
-                yValues.add(norm_y)
-                tValues.add(norm_t)
-    
+            
+            xValues.add(x)
+            yValues.add(y)
+            tValues.add(t_raw)
+            tempValues.add(temp)
+            all_coords.append([x, y, t_raw])
+            all_temps.append([temp])
     return (
         np.array(training_data),
-        minX, maxX, minY, maxY,
-        min_time, max_time,
-        sorted(xValues), sorted(yValues), sorted(tValues)
+        sorted(xValues), sorted(yValues), sorted(tValues),all_coords,all_temps
     )
 
 
 
-df,minTemp,maxTemp = load_data()
-data,minX,maxX,minY,maxY,min_time,max_time,xValues,yValues,tValues = prepare_training_data(df,minTemp,maxTemp)
-X,Y,T = np.meshgrid(xValues,yValues,tValues)
+df = load_data()
+data,xValues,yValues,tValues,coords_array,temps_array = prepare_training_data(df)
+# Assuming xValues, yValues, tValues are sorted lists of unique coordinates
+coords_array = np.array(coords_array)
+temps_array = np.array(temps_array)
 
-X_true = np.hstack((X.flatten()[:,None],Y.flatten()[:,None],T.flatten()[:,None]))
+minX, maxX = xValues[0], xValues[-1]
+minY, maxY = yValues[0], yValues[-1]
+minT,maxT = tValues[0],tValues[-1]
+minTemp,maxTemp = np.min(temps_array),np.max(temps_array)
+xScale = maxX-minX
+yScale = maxY-minY
+tScale = maxT-minT
+tempScale = maxTemp-minTemp
 
-
-lb = X_true[0]
-ub = X_true[-1]
-
-
-total_points = len(xValues)*len(yValues)*len(tValues)
-
-N_u = 2000000
-
-
-idx = np.random.choice(total_points,N_u,replace=False)
-
-
-U_true = data[:, 3].flatten('F')[:,None]
+coords_array[:,0] = (coords_array[:,0]-minX)/xScale
+coords_array[:,1] = (coords_array[:,1]-minY)/yScale
+coords_array[:,2] = (coords_array[:,2]-minT)/tScale
 
 
-X_train_Nu = X_true[idx]
-U_train_Nu = U_true[idx]
+temps_array = (temps_array - minTemp) / tempScale
 
-X_train_Nu = torch.from_numpy(X_train_Nu).float().to(device)
-U_train_Nu = torch.from_numpy(U_train_Nu).float().to(device)
+print(temps_array,coords_array)
 
-X_true = torch.from_numpy(X_true).float().to(device)
-U_true = torch.from_numpy(U_true).float().to(device)
+X_train_Nu = torch.from_numpy(coords_array).float().to(device)
+U_train_Nu = torch.from_numpy(temps_array).float().to(device)
+l_b = X_train_Nu[0]
+u_b = X_train_Nu[-1]
 
+
+
+
+# Vertical boundaries (x=minX and x=maxX)
+bc_v_points = [] 
+for y in yValues:
+    for t in tValues:
+        bc_v_points.append([0, (y - minY)/yScale, (t-minT)/tScale])
+        bc_v_points.append([1, (y - minY)/yScale, (t-minT)/tScale])
+
+# Horizontal boundaries (y=minY and y=maxY)
+bc_h_points = []
+for x in xValues:
+    for t in tValues:
+        bc_h_points.append([(x - minX)/xScale, 0, (t-minT)/tScale])
+        bc_h_points.append([(x - minX)/xScale, 1, (t-minT)/tScale])
+
+X_bc_v = torch.from_numpy(np.array(bc_v_points)).float().to(device)
+X_bc_h = torch.from_numpy(np.array(bc_h_points)).float().to(device)
 f_hat = torch.zeros(X_train_Nu.shape[0],1).to(device)
      
 
@@ -148,14 +139,7 @@ class DNN(nn.Module):
     def forward(self,x):
               
         if torch.is_tensor(x) != True:         
-            x = torch.from_numpy(x)                
-        
-        u_b = torch.from_numpy(ub).float().to(device)
-        l_b = torch.from_numpy(lb).float().to(device)
-
-        #preprocessing input 
-        x = (x - l_b)/(u_b - l_b) #feature scaling              
-        
+            x = torch.from_numpy(x)                             
         #convert to float
         a = x.float()
         
@@ -198,78 +182,75 @@ class FCN():
         return loss_u
     
     def loss_PDE(self, X_train_Nu):
-        k = self.k
-        g = X_train_Nu.clone()
-        g.requires_grad = True
+            k = self.k
+            g = X_train_Nu.clone()
+            g.requires_grad = True
+            
+            u = self.dnn(g)
+            
+            # First derivatives
+            u_x_y_t= torch.autograd.grad(u, g, torch.ones_like(u), create_graph=True)[0]
+            u_t_norm = u_x_y_t[:, [2]]
+
+            # Second derivatives (Laplacian) - CORRECTED
+            u_xx_yy_tt = torch.autograd.grad(u_x_y_t, g, torch.ones_like(u_x_y_t), create_graph=True)[0]
+            # ... (rest of your chain rule code is fine) ...
+            u_xx_norm = u_xx_yy_tt[:,[0]]
+            u_yy_norm = u_xx_yy_tt[:,[1]]
+            u_t_norm = u_x_y_t[:,[2]]
+            d2Tdx2 =  (tempScale*u_xx_norm)/(xScale**2)
+            d2Tdy2 =  (tempScale*u_yy_norm)/(yScale**2)
+            dTdt =  (tempScale* u_t_norm) / tScale 
+
+            residual = d2Tdx2 + d2Tdy2 - ((DENSITY * SPECIFIC_HEAT_CAPACITY) / k) * dTdt + (Q / k)
+            
+            loss_f = self.loss_function(residual, f_hat)
+            return loss_f
+    
+    # In FCN, create separate loss methods or handle within one
+    def loss_BC(self, X_bc_vertical, X_bc_horizontal):
+        # --- Vertical Walls ---
+        g_v = X_bc_vertical.clone(); g_v.requires_grad = True
+        u_v = self.dnn(g_v)
+        u_x_v = (tempScale* torch.autograd.grad(u_v, g_v, torch.ones_like(u_v), create_graph=True)[0][:, [0]]) / xScale
+        loss_v = self.loss_function(u_x_v, torch.zeros_like(u_x_v))
+
+        # --- Horizontal Walls ---
+        g_h = X_bc_horizontal.clone(); g_h.requires_grad = True
+        u_h = self.dnn(g_h)
+        u_y_h = (tempScale * torch.autograd.grad(u_h, g_h, torch.ones_like(u_h), create_graph=True)[0][:, [1]]) / yScale
+        loss_h = self.loss_function(u_y_h, torch.zeros_like(u_y_h))
+
+        return loss_v + loss_h
+    # Then in your total loss function
+    # In your FCN class
+    def loss(self, x_data, y_data, x_bc_v, x_bc_h): # Make sure to pass correct BC points
+        loss_u = self.loss_data(x_data, y_data)
+        loss_f = self.loss_PDE(x_data)
+        loss_bc = self.loss_BC(x_bc_v, x_bc_h)
+
+        # --- NEW WEIGHTS FOR LOSS BALANCING ---
+        w_data = 1.0
+        w_physics = 1.0  # Start with this
+        w_bc = 1.0         # Start with this
+
+        loss_val = (w_data * loss_u) + (w_physics * loss_f) + (w_bc * loss_bc)
         
-        u = self.dnn(g)
-        
-        # Derivatives wrt NORMALIZED coordinates
-        u_grads = torch.autograd.grad(u, g, torch.ones_like(u), create_graph=True)[0]
-        u_t_norm = u_grads[:, [2]]
-        # Second derivatives wrt NORMALIZED coordinates
-        u_laplacian_grads = torch.autograd.grad(u_grads, g, torch.ones_like(u_grads), create_graph=True)[0]
-        u_xx_norm = u_laplacian_grads[:, [0]]
-        u_yy_norm = u_laplacian_grads[:, [1]]
-
-        # --- Apply the Chain Rule ---
-        # Get scaling factors from bounds
-        x_scale = maxX - minX
-        y_scale = maxY - minY
-        t_scale = max_time - min_time
-        temp_scale = maxTemp-minTemp
-
-        # Scale derivatives back to physical space
-        d2Tdx2 = (temp_scale* u_xx_norm) / (x_scale**2)
-        d2Tdy2 =(temp_scale* u_yy_norm) / (y_scale**2)
-        dTdt = (temp_scale* u_t_norm) / t_scale
-
-        # The PDE is now dimensionally consistent
-        residual = k*((d2Tdx2) + (d2Tdy2)) - (((DENSITY * SPECIFIC_HEAT_CAPACITY) ) * dTdt) + (Q)
-        
-        loss_f = self.loss_function(residual, f_hat)
-        return loss_f
-
-    def loss(self,x,y):
-
-        loss_u = self.loss_data(x,y)
-        loss_f = self.loss_PDE(x)
-        
-        loss_val = loss_u + loss_f
+        print(f"Iter {self.iter}: "
+            f"Weighted Losses -> Data: {w_data * loss_u:.3f}, "
+            f"Physics: {w_physics * loss_f:.3f}, "
+            f"BC: {w_bc * loss_bc:.3f}, "
+            f"K Value: {self.k}") 
         
         return loss_val
-     
-    'callable for optimizer'                                       
-    def closure(self):
-        
-        optimizer.zero_grad()
-        
-        loss = self.loss(X_train_Nu, U_train_Nu)
-        
-        loss.backward()
-                
-        self.iter += 1
-        
-
-        error_vec = PINN.test()
-    
-        print(
-            'Relative Error(Test): %.5f , 𝜆_real = [0.015,], k_PINN = [%.5f]' %
-            (
-                error_vec.cpu().detach().numpy(),
-                self.k.item(),
-            )
-        )
-            
-
-        return loss        
+           
     
     'test neural network'
     def test(self):
                 
-        u_pred = self.dnn(X_true)
+        u_pred = self.dnn(X_train_Nu)
         
-        error_vec = torch.linalg.norm((U_true-u_pred),2)/torch.linalg.norm(U_true,2)        # Relative L2 Norm of the error (Vector)
+        error_vec = torch.linalg.norm((U_train_Nu-u_pred),2)/torch.linalg.norm(U_train_Nu,2)        # Relative L2 Norm of the error (Vector)
         
                 
         return error_vec
@@ -279,19 +260,18 @@ layers = np.array([3,20,20,20,20,20,20,20,20,1])
 PINN = FCN(layers)
 
 params = list(PINN.dnn.parameters())
-'L-BFGS Optimizer'
-'L-BFGS Optimizer'
-optimizer = torch.optim.LBFGS(params, lr, 
-                              max_iter = steps, 
-                              max_eval = None, 
-                              tolerance_grad = 1e-11, 
-                              tolerance_change = 1e-11, 
-                              history_size = 100, 
-                              line_search_fn = 'strong_wolfe')
+# Replace LBFGS with Adam
+optimizer = torch.optim.Adam(params, lr=1e-3) # Use a smaller learning rate for Adam
 
 start_time = time.time()
+# Your training loop will need to change from a closure-based one
+# to a standard loop:
+for i in range(steps):
+    optimizer.zero_grad()
+    loss = PINN.loss(X_train_Nu, U_train_Nu, X_bc_v, X_bc_h) # Pass correct BC points
+    loss.backward()
+    optimizer.step()
 
-optimizer.step(PINN.closure)
     
     
 elapsed = time.time() - start_time                
