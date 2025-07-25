@@ -7,24 +7,33 @@ from torch import nn
 from torch import autograd
 import time
 import pandas as pd
-
+import os
+import csv
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-steps=20000
+steps=100000
 
 # === Constants ===
 POWER_APPLIED = 0.15
 DENSITY = 1.68
 SPECIFIC_HEAT_CAPACITY = 0.96
-TIME_STEP = 0.01
 Q = 2.192
+THERMAL_CONDUCTIVITY = 10
+INITIAL_TEMP = 21.23
+NUM_DIV_X=10
+NUM_DIV_Y=10
+DURATION = 10
+
+WIDTH=1
+HEIGHT=1
+TIMESTEP=0.1
 
 
 # === Data Loading ===
-def load_data(filepath="temperature_output.csv"):
+def load_data(filepath="temperature_output_from_pinn.csv"):
     df = pd.read_csv(filepath)
             
     return df
@@ -73,45 +82,27 @@ temps_array = np.array(temps_array)
 minX, maxX = xValues[0], xValues[-1]
 minY, maxY = yValues[0], yValues[-1]
 minT,maxT = tValues[0],tValues[-1]
-minTemp,maxTemp = np.min(temps_array),np.max(temps_array)
 xScale = maxX-minX
 yScale = maxY-minY
 tScale = maxT-minT
-tempScale = maxTemp-minTemp
 
 coords_array[:,0] = (coords_array[:,0]-minX)/xScale
 coords_array[:,1] = (coords_array[:,1]-minY)/yScale
 coords_array[:,2] = (coords_array[:,2]-minT)/tScale
 
-
-temps_array = (temps_array - minTemp) / tempScale
-
-print(temps_array,coords_array)
-
+ 
 X_train_Nu = torch.from_numpy(coords_array).float().to(device)
 U_train_Nu = torch.from_numpy(temps_array).float().to(device)
-l_b = X_train_Nu[0]
-u_b = X_train_Nu[-1]
 
 
 
 
-# Vertical boundaries (x=minX and x=maxX)
-bc_v_points = [] 
-for y in yValues:
-    for t in tValues:
-        bc_v_points.append([0, (y - minY)/yScale, (t-minT)/tScale])
-        bc_v_points.append([1, (y - minY)/yScale, (t-minT)/tScale])
-
-# Horizontal boundaries (y=minY and y=maxY)
-bc_h_points = []
+bc_t_points = []
 for x in xValues:
-    for t in tValues:
-        bc_h_points.append([(x - minX)/xScale, 0, (t-minT)/tScale])
-        bc_h_points.append([(x - minX)/xScale, 1, (t-minT)/tScale])
+    for y in yValues:
+        bc_t_points.append([(x - minX)/xScale, (y - minY)/yScale, 0])
 
-X_bc_v = torch.from_numpy(np.array(bc_v_points)).float().to(device)
-X_bc_h = torch.from_numpy(np.array(bc_h_points)).float().to(device)
+X_bc_t = torch.from_numpy(np.array(bc_t_points)).float().to(device)
 f_hat = torch.zeros(X_train_Nu.shape[0],1).to(device)
      
 
@@ -154,7 +145,7 @@ class DNN(nn.Module):
         return a
     
 
-k=2.0
+k=1.0
 
 class FCN():
     def __init__(self,layers):
@@ -180,105 +171,83 @@ class FCN():
         loss_u = self.loss_function(self.dnn(x), y)
       
         return loss_u
-    
+    # Inside FCN class
     def loss_PDE(self, X_train_Nu):
-            k = self.k
-            g = X_train_Nu.clone()
-            g.requires_grad = True
-            
-            u = self.dnn(g)
-            
-            # First derivatives
-            u_x_y_t= torch.autograd.grad(u, g, torch.ones_like(u), create_graph=True)[0]
-            u_t_norm = u_x_y_t[:, [2]]
-
-            # Second derivatives (Laplacian) - CORRECTED
-            u_xx_yy_tt = torch.autograd.grad(u_x_y_t, g, torch.ones_like(u_x_y_t), create_graph=True)[0]
-            # ... (rest of your chain rule code is fine) ...
-            u_xx_norm = u_xx_yy_tt[:,[0]]
-            u_yy_norm = u_xx_yy_tt[:,[1]]
-            u_t_norm = u_x_y_t[:,[2]]
-            d2Tdx2 =  (tempScale*u_xx_norm)/(xScale**2)
-            d2Tdy2 =  (tempScale*u_yy_norm)/(yScale**2)
-            dTdt =  (tempScale* u_t_norm) / tScale 
-
-            residual = d2Tdx2 + d2Tdy2 - ((DENSITY * SPECIFIC_HEAT_CAPACITY) / k) * dTdt + (Q / k)
-            
-            loss_f = self.loss_function(residual, f_hat)
-            return loss_f
+        k = self.k
+        g = X_train_Nu.clone()
+        g.requires_grad = True
+        u = self.dnn(g)
+        u_x_y_t = torch.autograd.grad(u, g, torch.ones_like(u), create_graph=True)[0]
+        u_xx_yy_tt = torch.autograd.grad(u_x_y_t, g, torch.ones_like(u_x_y_t), create_graph=True)[0]
+        u_xx_norm = u_xx_yy_tt[:, [0]]
+        u_yy_norm = u_xx_yy_tt[:, [1]]
+        u_t_norm = u_x_y_t[:, [2]]
+        d2Tdx2 = (u_xx_norm) / (xScale**2)
+        d2Tdy2 = (u_yy_norm) / (yScale**2)
+        dTdt = ( u_t_norm) / tScale
+        residual = d2Tdx2 + d2Tdy2 - ((DENSITY * SPECIFIC_HEAT_CAPACITY) / k) * dTdt + (Q / k)
+        loss_f = self.loss_function(residual , f_hat)
+        return loss_f
     
     # In FCN, create separate loss methods or handle within one
-    def loss_BC(self, X_bc_vertical, X_bc_horizontal):
-        # --- Vertical Walls ---
-        g_v = X_bc_vertical.clone(); g_v.requires_grad = True
-        u_v = self.dnn(g_v)
-        u_x_v = (tempScale* torch.autograd.grad(u_v, g_v, torch.ones_like(u_v), create_graph=True)[0][:, [0]]) / xScale
-        loss_v = self.loss_function(u_x_v, torch.zeros_like(u_x_v))
+    def loss_BC(self, T_bc):
 
-        # --- Horizontal Walls ---
-        g_h = X_bc_horizontal.clone(); g_h.requires_grad = True
-        u_h = self.dnn(g_h)
-        u_y_h = (tempScale * torch.autograd.grad(u_h, g_h, torch.ones_like(u_h), create_graph=True)[0][:, [1]]) / yScale
-        loss_h = self.loss_function(u_y_h, torch.zeros_like(u_y_h))
-
-        return loss_v + loss_h
+        g_t = T_bc.clone(); g_t.requires_grad = True
+        u_t = self.dnn(g_t)
+        loss_t = self.loss_function(u_t-INITIAL_TEMP, torch.zeros_like(u_t))
+        return  loss_t
     # Then in your total loss function
     # In your FCN class
-    def loss(self, x_data, y_data, x_bc_v, x_bc_h): # Make sure to pass correct BC points
+    def loss(self, x_data, y_data,X_bc_t):
         loss_u = self.loss_data(x_data, y_data)
         loss_f = self.loss_PDE(x_data)
-        loss_bc = self.loss_BC(x_bc_v, x_bc_h)
-
-        # --- NEW WEIGHTS FOR LOSS BALANCING ---
+        loss_bc = self.loss_BC(X_bc_t)
+        # Adaptive weights
         w_data = 1.0
-        w_physics = 1.0  # Start with this
-        w_bc = 1.0         # Start with this
-
-        loss_val = (w_data * loss_u) + (w_physics * loss_f) + (w_bc * loss_bc)
-        
-        print(f"Iter {self.iter}: "
-            f"Weighted Losses -> Data: {w_data * loss_u:.3f}, "
-            f"Physics: {w_physics * loss_f:.3f}, "
-            f"BC: {w_bc * loss_bc:.3f}, "
-            f"K Value: {self.k}") 
-        
+        w_physics = 1e-4
+        w_bc = 1.0
+        loss_val = w_data * loss_u + w_physics * loss_f + w_bc * loss_bc
+        print(f"Iter {self.iter}: Data: {w_data * loss_u:.6f}, Physics: {w_physics * loss_f:.6f}, "
+            f"BC: {w_bc * loss_bc:.6f}, k: {self.k.item():.6f}")
+        self.iter += 1
         return loss_val
-           
+            
     
-    'test neural network'
-    def test(self):
-                
-        u_pred = self.dnn(X_train_Nu)
-        
-        error_vec = torch.linalg.norm((U_train_Nu-u_pred),2)/torch.linalg.norm(U_train_Nu,2)        # Relative L2 Norm of the error (Vector)
-        
-                
-        return error_vec
+            
+    def test(self,x_data):
+        return self.dnn(x_data)
 
 
-layers = np.array([3,20,20,20,20,20,20,20,20,1])
+# Early stopping parameters
+early_stopping_patience = 1000  # How many steps to wait for improvement
+best_loss = float('inf')
+patience_counter = 0
+best_model_state = None
+
+layers = np.array([3, 32, 32, 32, 32, 1])
 PINN = FCN(layers)
 
-params = list(PINN.dnn.parameters())
-# Replace LBFGS with Adam
-optimizer = torch.optim.Adam(params, lr=1e-3) # Use a smaller learning rate for Adam
+# Training loop
+optimizer = torch.optim.Adam(PINN.dnn.parameters(), lr=0.001)
+k_history = []
+csv_file = "k_history.csv"
+if not os.path.exists(csv_file):
+    with open(csv_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Epoch", "k"])
 
-start_time = time.time()
-# Your training loop will need to change from a closure-based one
-# to a standard loop:
-for i in range(steps):
+while 1:
     optimizer.zero_grad()
-    loss = PINN.loss(X_train_Nu, U_train_Nu, X_bc_v, X_bc_h) # Pass correct BC points
+    loss = PINN.loss(X_train_Nu, U_train_Nu, X_bc_t)
     loss.backward()
     optimizer.step()
 
+    k_value = PINN.k.item()
+    k_history.append(k_value)
+
+    with open(csv_file, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([len(k_history) - 1, k_value])
+
+
     
-    
-elapsed = time.time() - start_time                
-print('Training time: %.2f' % (elapsed))
-
-
-''' Model Accuracy ''' 
-error_vec, u_pred = PINN.test()
-
-print('Test Error: %.5f'  % (error_vec))
