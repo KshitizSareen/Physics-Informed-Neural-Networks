@@ -160,7 +160,6 @@ class FCN():
 
         'Call our DNN'
         self.dnn = DNN(layers).to(device)
-        self.dnn.register_parameter('k',self.k)
 
         'Loss Function'
 
@@ -204,8 +203,8 @@ class FCN():
         loss_bc = self.loss_BC(X_bc_t)
         # Adaptive weights
         w_data = 1.0
-        w_physics = 1e-4
-        w_bc = 1.0
+        w_physics = 1e4
+        w_bc = 1e4
         loss_val = w_data * loss_u + w_physics * loss_f + w_bc * loss_bc
         print(f"Iter {self.iter}: Data: {w_data * loss_u:.6f}, Physics: {w_physics * loss_f:.6f}, "
             f"BC: {w_bc * loss_bc:.6f}, k: {self.k.item():.6f}")
@@ -227,8 +226,6 @@ best_model_state = None
 layers = np.array([3, 32, 32, 32, 32, 1])
 PINN = FCN(layers)
 
-# Training loop
-optimizer = torch.optim.Adam(PINN.dnn.parameters(), lr=0.001)
 k_history = []
 csv_file = "k_history.csv"
 if not os.path.exists(csv_file):
@@ -236,18 +233,28 @@ if not os.path.exists(csv_file):
         writer = csv.writer(file)
         writer.writerow(["Epoch", "k"])
 
-while 1:
+
+# Adam phase
+optimizer = torch.optim.Adam([
+    {'params': PINN.dnn.parameters(), 'lr': 1e-3},
+    {'params': [PINN.k], 'lr': 1e-2}
+])
+for i in range(50000):
     optimizer.zero_grad()
     loss = PINN.loss(X_train_Nu, U_train_Nu, X_bc_t)
     loss.backward()
     optimizer.step()
+    # ... (early stopping and k_history logging)
 
-    k_value = PINN.k.item()
-    k_history.append(k_value)
+# LBFGS phase
+optimizer = torch.optim.LBFGS(list(PINN.dnn.parameters())+[PINN.k], lr=0.1,max_iter=1000)
+def closure():
+    optimizer.zero_grad()
+    loss = PINN.loss(X_train_Nu, U_train_Nu, X_bc_t)
+    loss.backward()
+    return loss
 
-    with open(csv_file, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([len(k_history) - 1, k_value])
+optimizer.step(closure)
 
 
     
