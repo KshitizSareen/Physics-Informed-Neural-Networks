@@ -14,7 +14,18 @@ x= data['x']
 t=data['t']
 usol = data['usol']
 
+#Set default dtype to float32
+torch.set_default_dtype(torch.float)
+
+#PyTorch random number generator
+torch.manual_seed(1234)
+
+# Random number generators in other libraries
+np.random.seed(1234)
+
+# Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 
 steps=20000
@@ -63,8 +74,6 @@ def plot3D_Matrix(x,t,y):
 
 plot3D(x,t,usol)
 
-print(x.shape,t.shape)
-
 X,T = np.meshgrid(x,t)
 
 X_true = np.hstack((X.flatten()[:,None],T.flatten()[:,None]))
@@ -73,7 +82,6 @@ X_true = np.hstack((X.flatten()[:,None],T.flatten()[:,None]))
 lb = X_true[0]
 ub = X_true[-1]
 
-print(lb,ub)
 
 total_points = len(x)*len(t)
 
@@ -83,14 +91,14 @@ idx = np.random.choice(total_points,N_u,replace=False)
 
 U_true = usol.flatten('F')[:,None]
 
-print(U_true)
 X_train_Nu = X_true[idx]
 U_train_Nu = U_true[idx]
 
-print(total_points,N_u)
+print(U_train_Nu)
 
 X_train_Nu = torch.from_numpy(X_train_Nu).float().to(device)
 U_train_Nu = torch.from_numpy(U_train_Nu).float().to(device)
+
 
 X_true = torch.from_numpy(X_true).float().to(device)
 U_true = torch.from_numpy(U_true).float().to(device)
@@ -193,11 +201,8 @@ class FCN():
 
         u_x_t=u_x_t[0]
 
-        print(u_x_t.shape)
                                 
         u_xx_tt = autograd.grad(u_x_t,g,torch.ones(X_train_Nu.shape).to(device), create_graph=True)[0]
-
-        print(u_xx_tt.shape)
                                                             
         u_x = u_x_t[:,[0]]
         
@@ -268,7 +273,7 @@ PINN = FCN(layers)
 params = list(PINN.dnn.parameters())
 'L-BFGS Optimizer'
 optimizer = torch.optim.LBFGS(params, lr, 
-                              max_iter = 1, 
+                              max_iter = steps, 
                               max_eval = None, 
                               tolerance_grad = 1e-11, 
                               tolerance_change = 1e-11, 
