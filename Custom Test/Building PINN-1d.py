@@ -31,7 +31,7 @@ TIMESTEP=0.1
 
 
 # === Data Loading ===
-def load_data(filepath="temperature_output_1d.csv"):
+def load_data(filepath="temperature_output_1d copy 2.csv"):
     df = pd.read_csv(filepath)
             
     return df
