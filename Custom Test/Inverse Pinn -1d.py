@@ -16,17 +16,19 @@ torch.manual_seed(seeds_num)
 np.random.seed(seeds_num)
 
 # === Constants ===
+POWER_APPLIED = 0.15
 DENSITY = 1.68
 SPECIFIC_HEAT_CAPACITY = 0.96
-Q = 1.94
+Q = 2.192
 INITIAL_TEMP = 21.23
 THERMAL_CONDUCTIVITY = 10
 NUM_DIV = 100
-DURATION = 1
-LENGTH = 1
-TIMESTEP = 0.01
+DURATION = 10
+LENGTH = 10
+TIMESTEP = 0.1
 steps = 100000
 
+# === Data Loading ===
 def load_data(filepath="temperature_output_1d.csv"):
     return pd.read_csv(filepath)
 
@@ -37,68 +39,52 @@ def prepare_training_data(df):
     tempValues = []
     all_coords = []
     columns = df.columns.tolist()
-
-    for idx in range(len(df)):
-        t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(columns)):
-            x = float(columns[i])
-            temp = df.iloc[idx, i]
-            xValues.add(x)
-            tValues.add(t_raw)
+    x_data = np.linspace(0, 1, 100)
+    t_data = np.linspace(0, 1, 100)
+    beta_1_true = 1/(20)
+    for x in x_data:
+        for t in t_data:
+            temp = np.exp(-(10*np.pi*beta_1_true)**2*t)*np.sin(10*np.pi*x)
             tempValues.append([temp])
-            all_coords.append([x, t_raw])
+            all_coords.append([x, t])
     
     return sorted(xValues), sorted(tValues), np.array(all_coords), np.array(tempValues)
 
-# Load raw data
+# Load and normalize data
 df = load_data()
 xValues, tValues, coords_array, tempValues = prepare_training_data(df)
 
-# Compute min/max for normalization
 minX, maxX = coords_array[:, 0].min(), coords_array[:, 0].max()
 minT, maxT = coords_array[:, 1].min(), coords_array[:, 1].max()
 minTemp, maxTemp = tempValues.min(), tempValues.max()
-
-# Avoid division by zero
-xScale = maxX - minX if maxX != minX else 1.0
-tScale = maxT - minT if maxT != minT else 1.0
-tempScale = maxTemp - minTemp if maxTemp != minTemp else 1.0
-
-# --- Normalize ---
-coords_array[:, 0] = 2 * (coords_array[:, 0] - minX) / xScale - 1  # x ∈ [-1, 1]
-coords_array[:, 1] = 2 * (coords_array[:, 1] - minT) / tScale - 1  # t ∈ [-1, 1]
-tempValues = 2 * (tempValues - minTemp) / tempScale - 1            # temp ∈ [-1, 1]
-
+xScale = maxX - minX
+tScale = maxT - minT
+tempScale = maxTemp - minTemp
 
 
 
 # --- All training data ---
-# --- Training data (for model training) ---
 X_train_Nu_tensor = torch.from_numpy(coords_array).float().to(device)
 U_train_Nu = torch.from_numpy(tempValues).float().to(device)
 x_train_Nu = X_train_Nu_tensor[:, 0:1]
 t_train_Nu = X_train_Nu_tensor[:, 1:2]
 
-
-
-# --- Boundary points from training set: x = -1 or x = 1 ---
-boundary_mask = np.isclose(coords_array[:, 0], -1.0) | np.isclose(coords_array[:, 0], 1.0)
+# --- Boundary points: x = 0 or x = 1 ---
+boundary_mask = np.isclose(coords_array[:, 0], 0.0) | np.isclose(coords_array[:, 0], 10.0)
 X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
 U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
 x_train_boundary = X_train_boundary_tensor[:, 0:1]
 t_train_boundary = X_train_boundary_tensor[:, 1:2]
 
-# --- Initial points from training set: t = -1 ---
-initial_mask = np.isclose(coords_array[:, 1], -1.0)
+# --- Initial points: t = 0 ---
+initial_mask = np.isclose(coords_array[:, 1], 0.0)
 X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
 U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
 x_train_initial = X_train_initial_tensor[:, 0:1]
 t_train_initial = X_train_initial_tensor[:, 1:2]
 
 
-
-
-k=12.0
+k=np.random.rand()
 
 class PINN(nn.Module):
     def __init__(self, input_dim=3, output_dim=2, hidden_dim=50, num_hidden=3, activation='sin'):
@@ -131,64 +117,33 @@ class PINN(nn.Module):
     def loss_PDE(self, x, t):
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
+        u_pred = self.forward(x, t)
+        
+        u_x = torch.autograd.grad(u_pred, x, grad_outputs=torch.ones_like(u_pred), retain_graph=True, create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        u_t = torch.autograd.grad(u_pred, t, grad_outputs=torch.ones_like(u_pred), create_graph=True)[0]
 
-        # Scale factors
-        dx_factor = 2.0 / xScale
-        dt_factor = 2.0 / tScale
 
-        # Derivatives w.r.t. normalized coordinates
-        du_dx_norm = torch.autograd.grad(u_pred_norm, x, grad_outputs=torch.ones_like(u_pred_norm), retain_graph=True, create_graph=True)[0]
-        d2u_dx2_norm = torch.autograd.grad(du_dx_norm, x, grad_outputs=torch.ones_like(du_dx_norm), create_graph=True)[0]
-        du_dt_norm = torch.autograd.grad(u_pred_norm, t, grad_outputs=torch.ones_like(u_pred_norm), create_graph=True)[0]
-
-        # Convert to real derivatives
-        u_t = du_dt_norm * dt_factor
-        u_xx = d2u_dx2_norm * (dx_factor ** 2)
-
-        # Scale temperature derivative back to physical units if temp is normalized
-        u_t = u_t * (tempScale / 2)
-        u_xx = u_xx * (tempScale / 2)
-
-        # PDE residual
-        residual = (self.k * u_t) - (THERMAL_CONDUCTIVITY * u_xx) - Q
+        residual =   u_t - self.k**2*u_xx
         loss_r = torch.mean(residual ** 2)
         return loss_r
-
     
     def loss_initial(self, x, t):    
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
+        u_pred = self.forward(x, t)
+        u_0 = torch.sin(10*np.pi*x)
 
-        # Convert prediction from normalized to physical temperature
-        u_pred_physical = 0.5 * (u_pred_norm + 1) * tempScale + minTemp
-
-        loss_i = torch.mean((u_pred_physical - INITIAL_TEMP) ** 2)
+        loss_i = torch.mean((u_pred - u_0) ** 2)
         return loss_i
-
-        
+    
     def loss_bounds(self, x, t):    
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
+        u_pred = self.forward(x, t)
 
-        # Compute du/dx_norm
-        dudx_norm = torch.autograd.grad(
-            outputs=u_pred_norm,
-            inputs=x,
-            grad_outputs=torch.ones_like(u_pred_norm),
-            create_graph=True,
-            retain_graph=True
-        )[0]
-
-        # Convert to physical space: dT/dx = (2 / x_scale) * dT/dx_norm
-        dudx_physical = dudx_norm * (2.0 / xScale)
-
-        # Enforce Neumann BC: dT/dx = 0
-        loss_b = torch.mean(dudx_physical ** 2)
+        loss_b = torch.mean(u_pred ** 2)
         return loss_b
-
     
     def loss_data(self, x, t, u):    
         u_pred = self.forward(x, t) 
@@ -201,69 +156,56 @@ class PINN(nn.Module):
         loss_b = self.loss_bounds(x_train_boundary, t_train_boundary)
         loss_d = self.loss_data(x_train_Nu, t_train_Nu, U_train_Nu) 
         return loss_r, loss_i, loss_b, loss_d
-    
 def closure():
     global lambda1, lambda2, lambda3, lambda4
-
+    
     optimizer.zero_grad()
+
+    # Calculate losses
     loss_r, loss_i, loss_b, loss_d = model.losses()
-    loss = lambda1 * loss_r + lambda2 * loss_i + lambda3 * loss_b + lambda4 * loss_d
+
+    # Calculate total loss with updated beta1
+    loss = lambda1*loss_r + lambda2*loss_i + lambda3*loss_b + lambda4*loss_d
+
+    # Backpropagation
     loss.backward()
 
-    # Logging
+    # Append losses for monitoring
     epoch_loss_r.append(loss_r.item())
     epoch_loss_b.append(loss_b.item())
     epoch_loss_i.append(loss_i.item())
     epoch_loss_d.append(loss_d.item())
+
     epoch_beta.append(model.k.item())
+    
     epoch_lambda1.append(lambda1)
     epoch_lambda2.append(lambda2)
     epoch_lambda3.append(lambda3)
     epoch_lambda4.append(lambda4)
-
-
-    print(f'Epoch {model.epoch}, loss = {loss.item():.4e},  k = {model.k.item():.6f}')
-
+    
+        # lambda1, lambda2, lambda3 = Adap_weights(model, X_train)
+    print('Epoch %d,  loss = %e, loss_r = %e, loss_i = %e, loss_b = %e, loss_d = %e, beta = %f, lambda1= %e , lambda2= %e, lambda3= %e, lambda4=%e' %
+            (epoch, float(loss), float(loss_r), float(loss_i), float(loss_b), float(loss_d),
+            model.k.item(), float(lambda1), float(lambda2), float(lambda3), float(lambda4)))
+        
     model.epoch += 1
     return loss
 
-
-def train_dg_pinn(model, optimizer, iters,
-                  x_train, t_train, u_train,
-                  early_stop_patience=500,
-                  min_delta=0,
-                  epoch_loss_d=[]):
-    best_val_loss = float('inf')
-    patience_counter = 0
-
+def train_dg_pinn(model, optimizer, iters=50001,
+           epoch_loss_d=[]):
     for epoch in range(iters):
         t1 = default_timer()
-
         optimizer.zero_grad()
-        train_loss = model.loss_data(x_train, t_train, u_train)
-        train_loss.backward()
+        loss_d = model.loss_data(x_train_Nu, t_train_Nu, U_train_Nu)
+        loss = loss_d
+        loss.backward()
         optimizer.step()
-
-        epoch_loss_d.append(train_loss.item())
-
+        epoch_loss_d.append(loss_d.item())
         t2 = default_timer()
-        print('Epoch %d, time = %e, train_loss = %e, k = %e' %
-              (epoch, float(t2 - t1), float(train_loss),  model.k.item()))
-
-        # Early stopping
-        if train_loss.item() < best_val_loss - min_delta:
-            best_val_loss = train_loss.item()
-            patience_counter = 0
-            best_model_state = model.state_dict()
-        else:
-            patience_counter += 1
-
-        if patience_counter >= early_stop_patience:
-            print(f"[Adam] Early stopping triggered at epoch {epoch}")
-            break
-
-    return epoch_loss_d, best_model_state
-
+        print('Epoch %d, time = %e, loss = %e,  lambda1 = %e' %
+                (epoch, float(t2-t1), float(loss),  model.k.item()))
+        
+    return epoch_loss_d
 
 # === Training ===
 torch.manual_seed(seeds_num)
@@ -286,51 +228,20 @@ model = PINN(
 ).to(device)
 print(model)
 
-iter_1s = 100000
-iter_2 = 100000  # Maximun number  of iterations for L-BFGS optimizer
+iter_1s = 2000
+iter_2 = 10000  # Maximun number  of iterations for L-BFGS optimizer
 t11 = default_timer()
 # Adam optimizer to decrease loss in Phase 1
 optimizer = torch.optim.Adam(list(model.parameters()), lr=1e-3)
-epoch_loss_d, best_model_state = train_dg_pinn(
-    model, optimizer, iters=iter_1s,
-    x_train=x_train_Nu, t_train=t_train_Nu, u_train=U_train_Nu,
-    epoch_loss_d=[]
-)
-import copy
+epoch_loss_d = train_dg_pinn(model, optimizer,  iters=iter_1s, epoch_loss_d=[])
+lambda1, lambda2, lambda3, lambda4 = 1,1,1,1
 
-# Define lambda weights if not already done
-lambda1, lambda2, lambda3, lambda4 = 1, 1, 1, 1
-
-# Reset optimizer to L-BFGS (after Adam)
-optimizer = torch.optim.LBFGS(
-    model.parameters(), lr=0.1, max_iter=1, history_size=100, line_search_fn="strong_wolfe"
-)
-
-# Setup early stopping
-best_loss_total = float('inf')
-patience_counter = 0
-early_stop_patience = 200
-min_delta = 0  # Small improvement threshold
-
-# L-BFGS loop
+# L-BFGS optimizer for fine-tuning in Phase 2
+optimizer = torch.optim.LBFGS(list(model.parameters()), lr=1e-1, max_iter=1,
+                            history_size=100)
 for epoch in range(iter_2):
     optimizer.zero_grad()
-    loss = optimizer.step(closure)
-
-
-    if loss < best_loss_total - min_delta:
-        best_loss_total = loss
-        patience_counter = 0
-        best_model_state = model.state_dict()  # Save best model
-    else:
-        patience_counter += 1
-
-    if patience_counter >= early_stop_patience:
-        print(f"[L-BFGS] Early stopping triggered at epoch {epoch}")
-        break
-
-
-
+    optimizer.step(closure)
 
 t22 = default_timer()
 print('Time elapsed: %.2f min' % ((t22 - t11) / 60))

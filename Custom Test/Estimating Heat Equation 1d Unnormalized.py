@@ -54,20 +54,6 @@ def prepare_training_data(df):
 df = load_data()
 xValues, tValues, coords_array, tempValues = prepare_training_data(df)
 
-# Compute min/max for normalization
-minX, maxX = coords_array[:, 0].min(), coords_array[:, 0].max()
-minT, maxT = coords_array[:, 1].min(), coords_array[:, 1].max()
-minTemp, maxTemp = tempValues.min(), tempValues.max()
-
-# Avoid division by zero
-xScale = maxX - minX if maxX != minX else 1.0
-tScale = maxT - minT if maxT != minT else 1.0
-tempScale = maxTemp - minTemp if maxTemp != minTemp else 1.0
-
-# --- Normalize ---
-coords_array[:, 0] = 2 * (coords_array[:, 0] - minX) / xScale - 1  # x ∈ [-1, 1]
-coords_array[:, 1] = 2 * (coords_array[:, 1] - minT) / tScale - 1  # t ∈ [-1, 1]
-tempValues = 2 * (tempValues - minTemp) / tempScale - 1            # temp ∈ [-1, 1]
 
 
 
@@ -82,14 +68,14 @@ t_train_Nu = X_train_Nu_tensor[:, 1:2]
 
 
 # --- Boundary points from training set: x = -1 or x = 1 ---
-boundary_mask = np.isclose(coords_array[:, 0], -1.0) | np.isclose(coords_array[:, 0], 1.0)
+boundary_mask = np.isclose(coords_array[:, 0], 0.0) | np.isclose(coords_array[:, 0], 10.0)
 X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
 U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
 x_train_boundary = X_train_boundary_tensor[:, 0:1]
 t_train_boundary = X_train_boundary_tensor[:, 1:2]
 
 # --- Initial points from training set: t = -1 ---
-initial_mask = np.isclose(coords_array[:, 1], -1.0)
+initial_mask = np.isclose(coords_array[:, 1], 0.0)
 X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
 U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
 x_train_initial = X_train_initial_tensor[:, 0:1]
@@ -131,26 +117,12 @@ class PINN(nn.Module):
     def loss_PDE(self, x, t):
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
+        u_pred = self.forward(x, t)
 
-        # Scale factors
-        dx_factor = 2.0 / xScale
-        dt_factor = 2.0 / tScale
+        u_x = torch.autograd.grad(u_pred, x, grad_outputs=torch.ones_like(u_pred), retain_graph=True, create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+        u_t = torch.autograd.grad(u_pred, t, grad_outputs=torch.ones_like(u_pred), create_graph=True)[0]
 
-        # Derivatives w.r.t. normalized coordinates
-        du_dx_norm = torch.autograd.grad(u_pred_norm, x, grad_outputs=torch.ones_like(u_pred_norm), retain_graph=True, create_graph=True)[0]
-        d2u_dx2_norm = torch.autograd.grad(du_dx_norm, x, grad_outputs=torch.ones_like(du_dx_norm), create_graph=True)[0]
-        du_dt_norm = torch.autograd.grad(u_pred_norm, t, grad_outputs=torch.ones_like(u_pred_norm), create_graph=True)[0]
-
-        # Convert to real derivatives
-        u_t = du_dt_norm * dt_factor
-        u_xx = d2u_dx2_norm * (dx_factor ** 2)
-
-        # Scale temperature derivative back to physical units if temp is normalized
-        u_t = u_t * (tempScale / 2)
-        u_xx = u_xx * (tempScale / 2)
-
-        # PDE residual
         residual = (self.k * u_t) - (THERMAL_CONDUCTIVITY * u_xx) - Q
         loss_r = torch.mean(residual ** 2)
         return loss_r
@@ -159,35 +131,28 @@ class PINN(nn.Module):
     def loss_initial(self, x, t):    
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
-
-        # Convert prediction from normalized to physical temperature
-        u_pred_physical = 0.5 * (u_pred_norm + 1) * tempScale + minTemp
-
-        loss_i = torch.mean((u_pred_physical - INITIAL_TEMP) ** 2)
+        u_pred = self.forward(x, t)
+        loss_i = torch.mean((u_pred - INITIAL_TEMP) ** 2)
         return loss_i
+
 
         
     def loss_bounds(self, x, t):    
         x = x.requires_grad_()
         t = t.requires_grad_()
-        u_pred_norm = self.forward(x, t)
+        u_pred = self.forward(x, t)
 
-        # Compute du/dx_norm
-        dudx_norm = torch.autograd.grad(
-            outputs=u_pred_norm,
+        dudx = torch.autograd.grad(
+            outputs=u_pred,
             inputs=x,
-            grad_outputs=torch.ones_like(u_pred_norm),
+            grad_outputs=torch.ones_like(u_pred),
             create_graph=True,
             retain_graph=True
         )[0]
 
-        # Convert to physical space: dT/dx = (2 / x_scale) * dT/dx_norm
-        dudx_physical = dudx_norm * (2.0 / xScale)
-
-        # Enforce Neumann BC: dT/dx = 0
-        loss_b = torch.mean(dudx_physical ** 2)
+        loss_b = torch.mean(dudx ** 2)  # Neumann BC: dT/dx = 0
         return loss_b
+
 
     
     def loss_data(self, x, t, u):    
