@@ -2,12 +2,15 @@ import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import time
 from torch import nn
 from timeit import default_timer
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Set default dtype to float32
 torch.set_default_dtype(torch.float32)
 
+# Set default types and seeds
 seeds_num = 666
 torch.manual_seed(seeds_num)
 np.random.seed(seeds_num)
@@ -18,14 +21,30 @@ SPECIFIC_HEAT_CAPACITY = 0.96
 Q = 2.192
 INITIAL_TEMP = 21.23
 THERMAL_CONDUCTIVITY = 10
+NUM_DIV = 100
+DURATION = 1
+LENGTH = 1
+TIMESTEP = 0.01
+steps = 100000
 
-true_values = {"rho": DENSITY, "cp": SPECIFIC_HEAT_CAPACITY, "lam": THERMAL_CONDUCTIVITY}
+# Map parameter name → true value
+true_values = {
+    "rho": DENSITY,
+    "cp":  SPECIFIC_HEAT_CAPACITY,
+    "lam": THERMAL_CONDUCTIVITY,
+}
+
 
 def load_data(filepath="temperature_output.csv"):
     return pd.read_csv(filepath)
 
+# === Prepare Training Data ===
 def prepare_training_data(df):
+    xValues = set()
+    yValues = set()
+    tValues = set()
     all_columns = df.columns.tolist()
+
     all_coords = []
     all_temps = []
     for idx in range(len(df)):
@@ -34,60 +53,111 @@ def prepare_training_data(df):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
+
+            
+            xValues.add(x)
+            yValues.add(y)
+            tValues.add(t_raw)
             all_coords.append([x, y, t_raw])
             all_temps.append([temp])
-    return np.array(all_coords), np.array(all_temps)
+    return (
+        np.array(all_coords),np.array(all_temps)
+    )
 
-# -------------------------
-# Load + normalize ONLY temperature
-# -------------------------
-df = load_data()
+
+# Load raw data
+df = load_data() 
 coords_array, tempValues = prepare_training_data(df)
 
-minX, maxX = coords_array[:, 0].min(), coords_array[:, 0].max()
-minY, maxY = coords_array[:, 1].min(), coords_array[:, 1].max()
-minT, maxT = coords_array[:, 2].min(), coords_array[:, 2].max()
-minTemp, maxTemp = tempValues.min(), tempValues.max()
+minX,maxX = coords_array[:,0].min(),coords_array[:,0].max()
+minY,maxY = coords_array[:,1].min(),coords_array[:,1].max()
+minT,maxT = coords_array[:,2].min(),coords_array[:,2].max()
+minTemp,maxTemp = tempValues.min(),tempValues.max()
 
-tempValues = (2 * ((tempValues - minTemp) / (maxTemp - minTemp))) - 1  # [-1,1]
+coords_array[:,0] = (2 * ((coords_array[:,0]-minX) / (maxX - minX))) - 1
+coords_array[:,1] = (2 * ((coords_array[:,1]-minY) / (maxY - minY))) - 1
+coords_array[:,2] = (2 * ((coords_array[:,2]-minT) / (maxT - minT))) - 1
+tempValues =  (2 * ((tempValues-minTemp) / (maxTemp - minTemp))) - 1
 
-X_train_tensor = torch.from_numpy(coords_array).float().to(device)
-U_train = torch.from_numpy(tempValues).float().to(device)
+# --- No normalization ---
 
-x_train = X_train_tensor[:, 0:1]
-y_train = X_train_tensor[:, 1:2]
-t_train = X_train_tensor[:, 2:3]
+# --- All training data ---
+X_train_Nu_tensor = torch.from_numpy(coords_array).float().to(device)
+U_train_Nu = torch.from_numpy(tempValues).float().to(device)
+x_train_Nu = X_train_Nu_tensor[:, 0:1]
+y_train_Nu = X_train_Nu_tensor[:, 1:2]
+t_train_Nu = X_train_Nu_tensor[:, 2:3]
 
-# Boundary + Initial masks in PHYSICAL coords
+
+# --- Boundary points: x = 0 or x = max, y = 0 or y = max ---
 eps = 1e-6
+
 boundary_mask = (
-    np.isclose(coords_array[:, 0], minX, atol=eps) | np.isclose(coords_array[:, 0], maxX, atol=eps) |
-    np.isclose(coords_array[:, 1], minY, atol=eps) | np.isclose(coords_array[:, 1], maxY, atol=eps)
+    np.isclose(coords_array[:, 0], -1.0, atol=eps) | np.isclose(coords_array[:, 0], 1.0, atol=eps) |
+    np.isclose(coords_array[:, 1], -1.0, atol=eps) | np.isclose(coords_array[:, 1], 1.0, atol=eps)
 )
-initial_mask = np.isclose(coords_array[:, 2], minT, atol=eps)
 
-Xb = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
-Ub = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
-xb, yb, tb = Xb[:, 0:1], Xb[:, 1:2], Xb[:, 2:3]
+initial_mask = np.isclose(coords_array[:, 2], -1.0, atol=eps)
 
-X0 = torch.from_numpy(coords_array[initial_mask]).float().to(device)
-U0 = torch.from_numpy(tempValues[initial_mask]).float().to(device)
-x0, y0, t0 = X0[:, 0:1], X0[:, 1:2], X0[:, 2:3]
+X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
+U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
+x_train_boundary = X_train_boundary_tensor[:, 0:1]
+y_train_boundary = X_train_boundary_tensor[:, 1:2]
+t_train_boundary = X_train_boundary_tensor[:, 2:3]
 
-# -------------------------
-# Model
-# -------------------------
+X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
+U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
+x_train_initial = X_train_initial_tensor[:, 0:1]
+y_train_initial = X_train_initial_tensor[:, 1:2]
+t_train_initial = X_train_initial_tensor[:, 2:3]
+
+k = np.random.rand()
+
+class FourierFeatures(nn.Module):
+    """
+    Random Fourier Feature mapping:
+        gamma(x) = [sin(2π B x), cos(2π B x)]
+    where B ~ N(0, sigma^2).
+
+    Inputs:
+      in_dim: input dimension (3 for x,y,t)
+      num_features: number of Fourier frequencies (m)
+      sigma: bandwidth (higher -> higher frequency)
+      include_input: if True, concatenate original x with Fourier features
+    Output dim:
+      out_dim = (2*m) + (in_dim if include_input else 0)
+    """
+    def __init__(self, in_dim: int, num_features: int = 64, sigma: float = 10.0, include_input: bool = True):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_features = num_features
+        self.include_input = include_input
+
+        B = torch.randn(num_features, in_dim) * sigma  # (m, in_dim)
+        self.register_buffer("B", B)
+
+    @property
+    def out_dim(self) -> int:
+        base = 2 * self.num_features
+        if self.include_input:
+            base += self.in_dim
+        return base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, in_dim)
+        # (N, m)
+        proj = (2.0 * np.pi) * (x @ self.B.t())
+        ff = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # (N, 2m)
+        if self.include_input:
+            return torch.cat([x, ff], dim=-1)
+        return ff
+
+
 class PINN(nn.Module):
-    """
-    PINN with Fourier features.
-    Exactly ONE trainable physical parameter among: rho, cp, lam.
-    Others fixed to true values.
-
-    Parameterization: phys = exp(hat) to keep positive.
-    """
     def __init__(
         self,
-        m=20,                      # number of Fourier frequencies
+        input_dim=3,
+        output_dim=1,
         hidden_dim=100,
         num_hidden=3,
         activation="tanh",
@@ -97,25 +167,39 @@ class PINN(nn.Module):
         true_lam=THERMAL_CONDUCTIVITY,
         init_ranges=None,
         eps=1e-12,
-        B_scale=3.0,               # frequency bandwidth
+
+        # ---- Fourier features ----
+        use_fourier_features: bool = True,
+        ff_num_features: int = 128,     # m (try 64–256)
+        ff_sigma: float = 5.0,          # bandwidth (try 1–20)
+        ff_include_input: bool = True,  # usually True
     ):
         super().__init__()
         self.eps = eps
+
         self.learn_param = learn_param.lower().strip()
         if self.learn_param not in {"rho", "cp", "lam", "none"}:
-            raise ValueError("learn_param must be one of: 'rho','cp','lam','none'")
+            raise ValueError("learn_param must be one of: 'rho', 'cp', 'lam', 'none'")
 
-        # ---- Fourier matrix B as BUFFER (moves with .to(device)) ----
-        B = torch.randn(m, 3, dtype=torch.float32) * B_scale
-        self.register_buffer("B", B)  # shape (m,3)
+        # ---- Fourier feature mapper ----
+        self.use_fourier_features = use_fourier_features
+        if self.use_fourier_features:
+            self.ff = FourierFeatures(
+                in_dim=input_dim,
+                num_features=ff_num_features,
+                sigma=ff_sigma,
+                include_input=ff_include_input
+            )
+            mlp_in_dim = self.ff.out_dim
+        else:
+            self.ff = None
+            mlp_in_dim = input_dim
 
-        input_dim = 2 * m
-
-        # ---- MLP ----
-        self.layers = nn.ModuleList([nn.Linear(input_dim, hidden_dim)])
+        # --- MLP ---
+        self.layers = nn.ModuleList([nn.Linear(mlp_in_dim, hidden_dim)])
         for _ in range(num_hidden - 1):
             self.layers.append(nn.Linear(hidden_dim, hidden_dim))
-        self.layers.append(nn.Linear(hidden_dim, 1))
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
 
         if activation == "tanh":
             self.activation = torch.tanh
@@ -126,21 +210,29 @@ class PINN(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
+        # --- Defaults for init ranges (PHYSICAL space) ---
         if init_ranges is None:
-            init_ranges = {"rho": (0.5, 5.0), "cp": (0.1, 2.5), "lam": (0.1, 50.0)}
+            init_ranges = {
+                "rho": (0.5, 5.0),
+                "cp":  (0.1, 2.5),
+                "lam": (0.1, 50.0),
+            }
 
+        # --- Fixed TRUE values as buffers (physical space) ---
         self.register_buffer("rho_fixed", torch.tensor([float(true_rho)], dtype=torch.float32))
         self.register_buffer("cp_fixed",  torch.tensor([float(true_cp)],  dtype=torch.float32))
         self.register_buffer("lam_fixed", torch.tensor([float(true_lam)], dtype=torch.float32))
 
+        # --- Trainable log-parameters (hat variables). Only one is a Parameter. ---
         self.rho_hat = None
-        self.cp_hat = None
+        self.cp_hat  = None
         self.lam_hat = None
 
         if self.learn_param != "none":
             lo, hi = init_ranges[self.learn_param]
             init_phys = (lo + (hi - lo) * torch.rand(1)).float()
             init_hat = torch.log(init_phys + self.eps)
+
             if self.learn_param == "rho":
                 self.rho_hat = nn.Parameter(init_hat)
             elif self.learn_param == "cp":
@@ -148,56 +240,77 @@ class PINN(nn.Module):
             elif self.learn_param == "lam":
                 self.lam_hat = nn.Parameter(init_hat)
 
+        self.epoch = 0
+
+
+    # --- Physical parameters (always positive) ---
     @property
     def rho(self):
-        return torch.exp(self.rho_hat) if self.rho_hat is not None else self.rho_fixed
+        if self.rho_hat is not None:
+            return torch.exp(self.rho_hat)
+        return self.rho_fixed
 
     @property
     def cp(self):
-        return torch.exp(self.cp_hat) if self.cp_hat is not None else self.cp_fixed
+        if self.cp_hat is not None:
+            return torch.exp(self.cp_hat)
+        return self.cp_fixed
 
     @property
     def lam(self):
-        return torch.exp(self.lam_hat) if self.lam_hat is not None else self.lam_fixed
+        if self.lam_hat is not None:
+            return torch.exp(self.lam_hat)
+        return self.lam_fixed
 
     def forward(self, x, y, t):
-        X = torch.cat([x, y, t], dim=-1)   # (N,3)
-        proj = (2.0 * torch.pi) * (X @ self.B.t())  # (N,m)
-        feats = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)  # (N,2m)
+        inp = torch.cat([x, y, t], dim=-1)  # (N,3)
 
-        out = feats
+        if self.use_fourier_features:
+            inp = self.ff(inp)  # (N, ff_out_dim)
+
+        out = inp
         for layer in self.layers[:-1]:
             out = self.activation(layer(out))
         out = self.layers[-1](out)
         return out
 
+
+    # PDE: rho*cp*u_t - lam*(u_xx + u_yy) - Q = 0
     def loss_PDE(self, x, y, t):
+        # Make sure these are leaf tensors requiring grad (robust for LBFGS)
         x = x.detach().clone().requires_grad_(True)
         y = y.detach().clone().requires_grad_(True)
         t = t.detach().clone().requires_grad_(True)
 
         u = self.forward(x, y, t)
 
-        u_x = torch.autograd.grad(u, x, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
-        u_xx = torch.autograd.grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0]
+        dx_factor = 2.0 / (maxX-minX)
+        dy_factor = 2.0 / (maxY-minY)
+        dt_factor = 2.0 / (maxT-minT)
 
-        u_y = torch.autograd.grad(u, y, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
-        u_yy = torch.autograd.grad(u_y, y, torch.ones_like(u_y), create_graph=True)[0]
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
 
-        u_t = torch.autograd.grad(u, t, torch.ones_like(u), create_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
 
-        # Undo temperature normalization for derivatives
-        temp_scale = (maxTemp - minTemp) / 2.0
-        u_t  = u_t  * temp_scale
-        u_xx = u_xx * temp_scale
-        u_yy = u_yy * temp_scale
+        u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
 
-        r = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
-        return torch.mean(r ** 2)
+        u_t = u_t * dt_factor
+        u_xx = u_xx * (dx_factor ** 2)
+        u_yy = u_yy * (dy_factor ** 2)
+
+        # Scale temperature derivative back to physical units if temp is normalized
+        u_t = u_t * ((maxTemp-minTemp) / 2)
+        u_xx = u_xx * ((maxTemp-minTemp) / 2)
+        u_yy = u_yy * ((maxTemp-minTemp) / 2)
+
+        residual = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
+        return torch.mean(residual ** 2)
 
     def loss_initial(self, x, y, t):
         u = self.forward(x, y, t)
-        u = 0.5 * (u + 1) * (maxTemp - minTemp) + minTemp
+        u = 0.5 * (u + 1) * (maxTemp-minTemp) + minTemp
         return torch.mean((u - INITIAL_TEMP) ** 2)
 
     def loss_bounds(self, x, y, t):
@@ -206,16 +319,18 @@ class PINN(nn.Module):
         t = t.detach().clone().requires_grad_(True)
 
         u = self.forward(x, y, t)
-        u_x = torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-        u_y = torch.autograd.grad(u, y, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
 
-        temp_scale = (maxTemp - minTemp) / 2.0
-        u_x = u_x * temp_scale
-        u_y = u_y * temp_scale
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+
+        u_x = ((maxTemp-minTemp)/2) *  u_x * (2.0 / (maxX-minX))
+        u_y = ((maxTemp-minTemp)/2) * u_y * (2.0 / (maxY-minY))
+
         return torch.mean(u_x ** 2) + torch.mean(u_y ** 2)
 
     def loss_data(self, x, y, t, u_obs):
-        return torch.mean((self.forward(x, y, t) - u_obs) ** 2)
+        u = self.forward(x, y, t)
+        return torch.mean((u - u_obs) ** 2)
 
     def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb):
         Lr = self.loss_PDE(x_all, y_all, t_all)
@@ -224,98 +339,223 @@ class PINN(nn.Module):
         Ld = self.loss_data(x_all, y_all, t_all, u_all)
         return Lr, Li, Lb, Ld
 
-# -------------------------
-# Train (LBFGS only, as in your code)
-# -------------------------
+
 def main(param_to_learn):
     torch.manual_seed(seeds_num)
 
-    model = PINN(learn_param=param_to_learn, m=20, hidden_dim=100, num_hidden=3, activation="tanh").to(device)
+    model = PINN(
+        learn_param=param_to_learn,
+        input_dim=3,
+        output_dim=1,
+        hidden_dim=100,
+        num_hidden=3,
+        activation="tanh",
+        use_fourier_features=True,
+        ff_num_features=128,
+        ff_sigma=5.0,
+        ff_include_input=True,
+    ).to(device)
 
-    lambda_d = lambda_r = lambda_b = lambda_i = 1.0
-    history = {"rho": [], "cp": [], "lam": [], "time_sec": []}
 
-    def get_param_val():
-        return float(getattr(model, param_to_learn).detach().cpu().item())
+    lambda_d, lambda_r, lambda_b, lambda_i = 1.0, 1.0, 1.0, 1.0
+
+    true_vals = {
+        "rho": float(DENSITY),
+        "cp": float(SPECIFIC_HEAT_CAPACITY),
+        "lam": float(THERMAL_CONDUCTIVITY),
+    }
+
+    history = {
+        "L_total": [], "L_pde": [], "L_ic": [], "L_bc": [], "L_data": [],
+        "rho": [], "cp": [], "lam": [],
+        "time_sec": [],
+    }
 
     t_start = default_timer()
 
-    lbfgs_iters = 2000
-    optimizer = torch.optim.LBFGS(model.parameters(), lr=0.1, max_iter=1, history_size=100, line_search_fn="strong_wolfe")
+    def get_param_val():
+        v = getattr(model, param_to_learn)
+        return float(v.detach().cpu().item())
 
-    # start equal weights
+    # ---------------------------
+    # Adaptive lambda computation (safe outside closure)
+    # ---------------------------
+    def compute_adaptive_lambdas(Lr, Li, Lb, Ld, include_hat_params=False):
+        losses = {"data": Ld, "pde": Lr, "bc": Lb, "ic": Li}
+
+        # If include_hat_params=False, we balance using ONLY field-network params,
+        # excluding the scalar inverse param (*_hat) so lambdas don't go crazy.
+        if include_hat_params:
+            params = [p for p in model.parameters() if p.requires_grad]
+        else:
+            params = [p for (n, p) in model.named_parameters()
+                      if p.requires_grad and not n.endswith("_hat")]
+
+        grads = {}
+        for name, term in losses.items():
+            g = torch.autograd.grad(
+                term, params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True
+            )
+            gn = torch.zeros((), device=device)
+            cnt = 0
+            for gi in g:
+                if gi is not None:
+                    gn = gn + gi.norm()
+                    cnt += 1
+            grads[name] = gn / max(cnt, 1)
+
+        total = sum(grads.values())
+        lambdas = {k: total / (grads[k] + 1e-8) for k in grads}
+        Z = sum(lambdas.values()) + 1e-12
+        lambdas = {k: (v / Z) for k, v in lambdas.items()}  # sum=1
+        return lambdas
+
+    # ---------------------------
+    # L-BFGS only
+    # ---------------------------
+    lbfgs_iters = 5000
+    log_every = 10
+
+    lbfgs_opt = torch.optim.LBFGS(
+        model.parameters(),
+        lr=0.1,
+        max_iter=1,
+        history_size=100,
+        line_search_fn="strong_wolfe"
+    )
+
+    # Early stopping (loss plateau)
+    best_loss = float("inf")
+    loss_min_delta = 1e-10
+    loss_patience = 200  # counts LOG CHECKS
+    loss_counter = 0
+
+    # Early stopping (param convergence)
+    param_min_delta = 1e-8
+    param_patience = 40  # counts LOG CHECKS
+    param_counter = 0
+    prev_param = None
+
+    # Start with uniform weights
     current_lambdas = {"pde": 0.25, "ic": 0.25, "bc": 0.25, "data": 0.25}
 
     def closure():
-        optimizer.zero_grad()
-        Lr, Li, Lb, Ld = model.losses(x_train, y_train, t_train, U_train, x0, y0, t0, xb, yb, tb)
+        lbfgs_opt.zero_grad()
+
+        Lr, Li, Lb, Ld = model.losses(
+            x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+            x_train_initial, y_train_initial, t_train_initial,
+            x_train_boundary, y_train_boundary, t_train_boundary
+        )
+
         L = (
             lambda_r * current_lambdas["pde"]  * Lr +
             lambda_i * current_lambdas["ic"]   * Li +
             lambda_b * current_lambdas["bc"]   * Lb +
             lambda_d * current_lambdas["data"] * Ld
         )
+
         L.backward()
         return L
 
     for it in range(lbfgs_iters):
-        # update grad-balanced lambdas once per outer iter (not inside closure)
+        # Update lambdas ONCE per outer iteration (freeze inside closure)
         with torch.enable_grad():
-            Lr, Li, Lb, Ld = model.losses(x_train, y_train, t_train, U_train, x0, y0, t0, xb, yb, tb)
-            losses = {"data": Ld, "pde": Lr, "bc": Lb, "ic": Li}
+            Lr, Li, Lb, Ld = model.losses(
+                x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+                x_train_initial, y_train_initial, t_train_initial,
+                x_train_boundary, y_train_boundary, t_train_boundary
+            )
+            current_lambdas = compute_adaptive_lambdas(Lr, Li, Lb, Ld, include_hat_params=False)
 
-            # exclude *_hat (inverse scalar) from balancing if desired
-            params = [p for (n, p) in model.named_parameters() if p.requires_grad and not n.endswith("_hat")]
+        L = lbfgs_opt.step(closure)
+        curr = float(L.detach())
 
-            grads = {}
-            for name, term in losses.items():
-                g = torch.autograd.grad(term, params, retain_graph=True, allow_unused=True, create_graph=False)
-                gn = torch.zeros((), device=device)
-                cnt = 0
-                for gi in g:
-                    if gi is not None:
-                        gn = gn + gi.norm()
-                        cnt += 1
-                grads[name] = gn / max(cnt, 1)
-
-            total_grad = sum(grads.values())
-            lambdas = {k: total_grad / (grads[k] + 1e-8) for k in grads}
-            Z = sum(lambdas.values()) + 1e-12
-            current_lambdas = {k: float((v / Z).detach().cpu().item()) for k, v in lambdas.items()}  # store as floats
-
-        L = optimizer.step(closure)
-        curr = float(L.detach().cpu().item())
-
+        # Track time/params (cheap)
         elapsed = default_timer() - t_start
-        history["rho"].append(float(model.rho.detach().cpu().item()))
-        history["cp"].append(float(model.cp.detach().cpu().item()))
-        history["lam"].append(float(model.lam.detach().cpu().item()))
+        history["rho"].append(float(model.rho.detach()))
+        history["cp"].append(float(model.cp.detach()))
+        history["lam"].append(float(model.lam.detach()))
         history["time_sec"].append(elapsed)
 
-        if it % 10 == 0 or it == lbfgs_iters - 1:
+        # Log + early stop every log_every
+        if it % log_every == 0 or it == lbfgs_iters - 1:
+            # recompute losses for reporting (no grads needed)
+            with torch.enable_grad():
+                Lr, Li, Lb, Ld = model.losses(
+                    x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+                    x_train_initial, y_train_initial, t_train_initial,
+                    x_train_boundary, y_train_boundary, t_train_boundary
+                )
+
             pv = get_param_val()
+
+            history["L_total"].append(curr)
+            history["L_pde"].append(float(Lr.detach()))
+            history["L_ic"].append(float(Li.detach()))
+            history["L_bc"].append(float(Lb.detach()))
+            history["L_data"].append(float(Ld.detach()))
+
+            # ---- loss plateau ES (per LOG) ----
+            if curr < best_loss - loss_min_delta:
+                best_loss = curr
+                loss_counter = 0
+            else:
+                loss_counter += 1
+
+            # ---- param convergence ES (per LOG) ----
+            if prev_param is None:
+                prev_param = pv
+                param_counter = 0
+            else:
+                if abs(pv - prev_param) < param_min_delta:
+                    param_counter += 1
+                else:
+                    param_counter = 0
+                prev_param = pv
+
             print(
-                f"[LBFGS {it:04d}] L={curr:.3e} | {param_to_learn}={pv:.6f} | "
-                f"lams(pde,ic,bc,data)=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},"
-                f"{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f})"
+                f"[LBFGS {it:05d}] L={curr:.3e} "
+                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+                f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
+                f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
+                f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f})"
             )
 
+            if param_counter >= param_patience:
+                print(f"[LBFGS] Early stopping: {param_to_learn} converged.")
+                break
+
+            if loss_counter >= loss_patience:
+                print(f"[LBFGS] Early stopping: loss plateau.")
+                break
+
+    # ---------------------------
+    # Plot + save
+    # ---------------------------
     t_total = default_timer() - t_start
     print(f"Total training time: {t_total/60:.2f} min")
+    print(f"wall-clock time (sec): {t_total:.2f}")
 
     plt.figure(figsize=(7, 4))
     plt.plot(history["time_sec"], history[param_to_learn], label=f"Estimated {param_to_learn}", linewidth=2)
-    plt.axhline(y=true_values[param_to_learn], color="black", linestyle="--", linewidth=2, label=f"True {param_to_learn}")
+    plt.axhline(y=true_vals[param_to_learn], color="black", linestyle="--", linewidth=2, label=f"True {param_to_learn}")
     plt.xlabel("Time (sec)")
     plt.ylabel(param_to_learn)
     plt.title(f"Convergence of {param_to_learn}")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+
     save_path = f"convergence_{param_to_learn}.png"
     plt.savefig(save_path, dpi=300)
     print(f"Saved parameter convergence plot to: {save_path}")
     plt.show()
 
-for param in ["rho", "cp", "lam"]:
+
+for param in [ "lam"]:
     main(param)
+

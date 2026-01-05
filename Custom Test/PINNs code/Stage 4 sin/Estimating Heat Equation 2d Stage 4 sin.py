@@ -294,7 +294,7 @@ def main(param_to_learn):
         output_dim=1,
         hidden_dim=100,
         num_hidden=3,
-        activation="tanh"
+        activation="sin"
     ).to(device)
 
     lambda_d, lambda_r, lambda_b, lambda_i = 1.0, 1.0, 1.0, 1.0

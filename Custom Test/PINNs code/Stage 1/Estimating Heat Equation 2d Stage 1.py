@@ -69,16 +69,6 @@ def prepare_training_data(df):
 df = load_data() 
 coords_array, tempValues = prepare_training_data(df)
 
-minX,maxX = coords_array[:,0].min(),coords_array[:,0].max()
-minY,maxY = coords_array[:,1].min(),coords_array[:,1].max()
-minT,maxT = coords_array[:,2].min(),coords_array[:,2].max()
-minTemp,maxTemp = tempValues.min(),tempValues.max()
-
-coords_array[:,0] = (2 * ((coords_array[:,0]-minX) / (maxX - minX))) - 1
-coords_array[:,1] = (2 * ((coords_array[:,1]-minY) / (maxY - minY))) - 1
-coords_array[:,2] = (2 * ((coords_array[:,2]-minT) / (maxT - minT))) - 1
-tempValues =  (2 * ((tempValues-minTemp) / (maxTemp - minTemp))) - 1
-
 # --- No normalization ---
 
 # --- All training data ---
@@ -88,23 +78,17 @@ x_train_Nu = X_train_Nu_tensor[:, 0:1]
 y_train_Nu = X_train_Nu_tensor[:, 1:2]
 t_train_Nu = X_train_Nu_tensor[:, 2:3]
 
-
 # --- Boundary points: x = 0 or x = max, y = 0 or y = max ---
-eps = 1e-6
-
-boundary_mask = (
-    np.isclose(coords_array[:, 0], -1.0, atol=eps) | np.isclose(coords_array[:, 0], 1.0, atol=eps) |
-    np.isclose(coords_array[:, 1], -1.0, atol=eps) | np.isclose(coords_array[:, 1], 1.0, atol=eps)
-)
-
-initial_mask = np.isclose(coords_array[:, 2], -1.0, atol=eps)
-
+boundary_mask = np.isclose(coords_array[:, 0], 0) | np.isclose(coords_array[:, 0], coords_array[:, 0].max()) | \
+                np.isclose(coords_array[:, 1], 0) | np.isclose(coords_array[:, 1], coords_array[:, 1].max())
 X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
 U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
 x_train_boundary = X_train_boundary_tensor[:, 0:1]
 y_train_boundary = X_train_boundary_tensor[:, 1:2]
 t_train_boundary = X_train_boundary_tensor[:, 2:3]
 
+# --- Initial points: t = 0 ---
+initial_mask = np.isclose(coords_array[:, 2], 0)
 X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
 U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
 x_train_initial = X_train_initial_tensor[:, 0:1]
@@ -229,10 +213,6 @@ class PINN(nn.Module):
 
         u = self.forward(x, y, t)
 
-        dx_factor = 2.0 / (maxX-minX)
-        dy_factor = 2.0 / (maxY-minY)
-        dt_factor = 2.0 / (maxT-minT)
-
         u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
         u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
 
@@ -241,21 +221,11 @@ class PINN(nn.Module):
 
         u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
 
-        u_t = u_t * dt_factor
-        u_xx = u_xx * (dx_factor ** 2)
-        u_yy = u_yy * (dy_factor ** 2)
-
-        # Scale temperature derivative back to physical units if temp is normalized
-        u_t = u_t * ((maxTemp-minTemp) / 2)
-        u_xx = u_xx * ((maxTemp-minTemp) / 2)
-        u_yy = u_yy * ((maxTemp-minTemp) / 2)
-
         residual = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
         return torch.mean(residual ** 2)
 
     def loss_initial(self, x, y, t):
         u = self.forward(x, y, t)
-        u = 0.5 * (u + 1) * (maxTemp-minTemp) + minTemp
         return torch.mean((u - INITIAL_TEMP) ** 2)
 
     def loss_bounds(self, x, y, t):
@@ -267,9 +237,6 @@ class PINN(nn.Module):
 
         u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
         u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
-
-        u_x = ((maxTemp-minTemp)/2) *  u_x * (2.0 / (maxX-minX))
-        u_y = ((maxTemp-minTemp)/2) * u_y * (2.0 / (maxY-minY))
 
         return torch.mean(u_x ** 2) + torch.mean(u_y ** 2)
 
@@ -286,6 +253,9 @@ class PINN(nn.Module):
 
 
 def main(param_to_learn):
+    # ---------------------------
+    # Stage 0 training setup
+    # ---------------------------
     torch.manual_seed(seeds_num)
 
     model = PINN(
@@ -294,96 +264,52 @@ def main(param_to_learn):
         output_dim=1,
         hidden_dim=100,
         num_hidden=3,
-        activation="tanh"
+        activation='tanh'
     ).to(device)
 
+    # Fixed lambda weights (Stage 0 control)
     lambda_d, lambda_r, lambda_b, lambda_i = 1.0, 1.0, 1.0, 1.0
-
-    true_vals = {
-        "rho": float(DENSITY),
-        "cp": float(SPECIFIC_HEAT_CAPACITY),
-        "lam": float(THERMAL_CONDUCTIVITY),
-    }
 
     history = {
         "L_total": [], "L_pde": [], "L_ic": [], "L_bc": [], "L_data": [],
         "rho": [], "cp": [], "lam": [],
-        "time_sec": [],
+        "pde_residual_rmse": [], "field_l2": [], "time_sec": [],
     }
 
     t_start = default_timer()
 
-    def get_param_val():
-        v = getattr(model, param_to_learn)
+    # ---------------------------
+    # Param-convergence early stopping config
+    # ---------------------------
+    # Stop if the learned parameter changes by less than param_min_delta
+    # for param_patience "logging checks" in a row.
+    param_patience = 30              # 30 * 100 = 3000 Adam steps of "no movement"
+    param_min_delta = 1e-6           # absolute change threshold in parameter value
+    param_counter = 0
+    prev_param_val = None
+
+    def get_learned_scalar_value():
+        # model.rho / model.cp / model.lam are properties -> always return a scalar tensor
+        v = getattr(model, param_to_learn)  # tensor shape [1]
         return float(v.detach().cpu().item())
 
     # ---------------------------
-    # Adaptive lambda computation (safe outside closure)
+    # Phase 1: Adam (full loss) + Early Stopping (loss + param convergence)
     # ---------------------------
-    def compute_adaptive_lambdas(Lr, Li, Lb, Ld, include_hat_params=False):
-        losses = {"data": Ld, "pde": Lr, "bc": Lb, "ic": Li}
+    adam_iters = 20000
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-        # If include_hat_params=False, we balance using ONLY field-network params,
-        # excluding the scalar inverse param (*_hat) so lambdas don't go crazy.
-        if include_hat_params:
-            params = [p for p in model.parameters() if p.requires_grad]
-        else:
-            params = [p for (n, p) in model.named_parameters()
-                      if p.requires_grad and not n.endswith("_hat")]
+    # Loss early stopping config
+    early_stop_patience = 2000
+    min_delta = 1e-8
+    check_every = 100
 
-        grads = {}
-        for name, term in losses.items():
-            g = torch.autograd.grad(
-                term, params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True
-            )
-            gn = torch.zeros((), device=device)
-            cnt = 0
-            for gi in g:
-                if gi is not None:
-                    gn = gn + gi.norm()
-                    cnt += 1
-            grads[name] = gn / max(cnt, 1)
-
-        total = sum(grads.values())
-        lambdas = {k: total / (grads[k] + 1e-8) for k in grads}
-        Z = sum(lambdas.values()) + 1e-12
-        lambdas = {k: (v / Z) for k, v in lambdas.items()}  # sum=1
-        return lambdas
-
-    # ---------------------------
-    # L-BFGS only
-    # ---------------------------
-    lbfgs_iters = 5000
-    log_every = 10
-
-    lbfgs_opt = torch.optim.LBFGS(
-        model.parameters(),
-        lr=0.1,
-        max_iter=1,
-        history_size=100,
-        line_search_fn="strong_wolfe"
-    )
-
-    # Early stopping (loss plateau)
     best_loss = float("inf")
-    loss_min_delta = 1e-10
-    loss_patience = 200  # counts LOG CHECKS
-    loss_counter = 0
+    best_state = None
+    patience_counter = 0
 
-    # Early stopping (param convergence)
-    param_min_delta = 1e-8
-    param_patience = 40  # counts LOG CHECKS
-    param_counter = 0
-    prev_param = None
-
-    # Start with uniform weights
-    current_lambdas = {"pde": 0.25, "ic": 0.25, "bc": 0.25, "data": 0.25}
-
-    def closure():
-        lbfgs_opt.zero_grad()
+    for it in range(adam_iters):
+        optimizer.zero_grad()
 
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
@@ -391,98 +317,188 @@ def main(param_to_learn):
             x_train_boundary, y_train_boundary, t_train_boundary
         )
 
-        L = (
-            lambda_r * current_lambdas["pde"]  * Lr +
-            lambda_i * current_lambdas["ic"]   * Li +
-            lambda_b * current_lambdas["bc"]   * Lb +
-            lambda_d * current_lambdas["data"] * Ld
-        )
-
+        L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
         L.backward()
-        return L
+        optimizer.step()
 
-    for it in range(lbfgs_iters):
-        # Update lambdas ONCE per outer iteration (freeze inside closure)
-        with torch.enable_grad():
-            Lr, Li, Lb, Ld = model.losses(
-                x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
-                x_train_initial, y_train_initial, t_train_initial,
-                x_train_boundary, y_train_boundary, t_train_boundary
-            )
-            current_lambdas = compute_adaptive_lambdas(Lr, Li, Lb, Ld, include_hat_params=False)
-
-        L = lbfgs_opt.step(closure)
         curr = float(L.detach())
 
-        # Track time/params (cheap)
+        # ----- Loss-based early stopping -----
+        if curr < best_loss - min_delta:
+            best_loss = curr
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += check_every
+
+        # ----- Param-convergence early stopping -----
+        # check if parameter stopped moving
+        param_val = get_learned_scalar_value()
+        if prev_param_val is None:
+            prev_param_val = param_val
+            param_counter = 0
+        else:
+            if abs(param_val - prev_param_val) < param_min_delta:
+                param_counter += 1
+            else:
+                param_counter = 0
+            prev_param_val = param_val
+
+        # ----- Logging -----
         elapsed = default_timer() - t_start
         history["rho"].append(float(model.rho.detach()))
         history["cp"].append(float(model.cp.detach()))
         history["lam"].append(float(model.lam.detach()))
         history["time_sec"].append(elapsed)
 
-        # Log + early stop every log_every
-        if it % log_every == 0 or it == lbfgs_iters - 1:
-            # recompute losses for reporting (no grads needed)
-            with torch.enable_grad():
-                Lr, Li, Lb, Ld = model.losses(
-                    x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
-                    x_train_initial, y_train_initial, t_train_initial,
-                    x_train_boundary, y_train_boundary, t_train_boundary
-                )
-
-            pv = get_param_val()
-
-            history["L_total"].append(curr)
-            history["L_pde"].append(float(Lr.detach()))
-            history["L_ic"].append(float(Li.detach()))
-            history["L_bc"].append(float(Lb.detach()))
-            history["L_data"].append(float(Ld.detach()))
-
-            # ---- loss plateau ES (per LOG) ----
-            if curr < best_loss - loss_min_delta:
-                best_loss = curr
-                loss_counter = 0
-            else:
-                loss_counter += 1
-
-            # ---- param convergence ES (per LOG) ----
-            if prev_param is None:
-                prev_param = pv
-                param_counter = 0
-            else:
-                if abs(pv - prev_param) < param_min_delta:
-                    param_counter += 1
-                else:
-                    param_counter = 0
-                prev_param = pv
-
+        # Evaluate periodically (loss ES + param-convergence ES)
+        if (it % check_every == 0) or (it == adam_iters - 1):
             print(
-                f"[LBFGS {it:05d}] L={curr:.3e} "
+                f"[Adam {it:06d}] L={curr:.3e} "
                 f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
-                f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f})"
+                f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
+                f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
+                f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
             )
 
-            if param_counter >= param_patience:
-                print(f"[LBFGS] Early stopping: {param_to_learn} converged.")
-                break
+        # ----- Stop conditions -----
+        if patience_counter >= early_stop_patience:
+            print(f"[Adam] Early stopping (loss) at iter={it} best_loss={best_loss:.3e}")
+            break
 
-            if loss_counter >= loss_patience:
-                print(f"[LBFGS] Early stopping: loss plateau.")
-                break
+        if param_counter >= param_patience:
+            print(
+                f"[Adam] Early stopping (param converged) at iter={it}: "
+                f"{param_to_learn} changed < {param_min_delta:g} for {param_patience} checks "
+                f"({param_patience*check_every} steps)."
+            )
+            break
+
+    # Restore best Adam model before L-BFGS
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        model.to(device)
+
+    # Reset param convergence tracker for LBFGS
+    param_counter = 0
+    prev_param_val = None
 
     # ---------------------------
-    # Plot + save
+    # Phase 2: L-BFGS + Early Stopping (loss + param convergence)
     # ---------------------------
+    lbfgs_iters = 2000
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=0.1,
+        max_iter=1,
+        history_size=100,
+        line_search_fn="strong_wolfe"
+    )
+
+    lbfgs_patience = 200
+    lbfgs_min_delta = 1e-10
+    best_lbfgs_loss = float("inf")
+    lbfgs_counter = 0
+
+    # Param ES for LBFGS (checks happen every log interval)
+    lbfgs_log_every = 10
+    lbfgs_param_patience = 40         # 40 logs * 10 iters/log = 400 LBFGS iterations "no movement"
+    lbfgs_param_min_delta = 1e-8
+    lbfgs_param_counter = 0
+    lbfgs_prev_param_val = None
+
+    def closure():
+        optimizer.zero_grad()
+        Lr, Li, Lb, Ld = model.losses(
+            x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+            x_train_initial, y_train_initial, t_train_initial,
+            x_train_boundary, y_train_boundary, t_train_boundary
+        )
+        L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
+        L.backward()
+        return L
+
+    for it in range(lbfgs_iters):
+        L = optimizer.step(closure)
+        curr = float(L.detach())
+
+        # Loss-based LBFGS early stopping
+        if curr < best_lbfgs_loss - lbfgs_min_delta:
+            best_lbfgs_loss = curr
+            lbfgs_counter = 0
+        else:
+            lbfgs_counter += 1
+
+        Lr, Li, Lb, Ld = model.losses(
+            x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+            x_train_initial, y_train_initial, t_train_initial,
+            x_train_boundary, y_train_boundary, t_train_boundary
+        )
+
+        # param convergence (LBFGS)
+        param_val = get_learned_scalar_value()
+        if lbfgs_prev_param_val is None:
+            lbfgs_prev_param_val = param_val
+            lbfgs_param_counter = 0
+        else:
+            if abs(param_val - lbfgs_prev_param_val) < lbfgs_param_min_delta:
+                lbfgs_param_counter += 1
+            else:
+                lbfgs_param_counter = 0
+            lbfgs_prev_param_val = param_val
+
+        elapsed = default_timer() - t_start
+        history["rho"].append(float(model.rho.detach()))
+        history["cp"].append(float(model.cp.detach()))
+        history["lam"].append(float(model.lam.detach()))
+        history["time_sec"].append(elapsed)
+
+        # Logging + param convergence checks
+        if it % lbfgs_log_every == 0 or it == lbfgs_iters - 1:
+            print(
+                f"[LBFGS {it:04d}] L={curr:.3e} "
+                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+                f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
+                f"{param_to_learn}={param_val:.6f} Δ<{lbfgs_param_min_delta:g}? streak={lbfgs_param_counter}/{lbfgs_param_patience} | "
+                f"best={best_lbfgs_loss:.3e} loss_patience={lbfgs_counter}/{lbfgs_patience}"
+            )
+
+        if lbfgs_param_counter >= lbfgs_param_patience:
+            print(
+                f"[L-BFGS] Early stopping (param converged) at iter={it}: "
+                f"{param_to_learn} changed < {lbfgs_param_min_delta:g} for {lbfgs_param_patience} logs."
+            )
+            break
+
+        if lbfgs_counter >= lbfgs_patience:
+            print(f"[L-BFGS] Early stopping (loss) at iter={it} best_loss={best_lbfgs_loss:.3e}")
+            break
+
+
     t_total = default_timer() - t_start
     print(f"Total training time: {t_total/60:.2f} min")
+
     print(f"wall-clock time (sec): {t_total:.2f}")
 
     plt.figure(figsize=(7, 4))
-    plt.plot(history["time_sec"], history[param_to_learn], label=f"Estimated {param_to_learn}", linewidth=2)
-    plt.axhline(y=true_vals[param_to_learn], color="black", linestyle="--", linewidth=2, label=f"True {param_to_learn}")
+
+    # Learned trajectory
+    plt.plot(
+        history["time_sec"],
+        history[param_to_learn],
+        label=f"Estimated {param_to_learn}",
+        linewidth=2
+    )
+
+    # True value (horizontal dashed line)
+    plt.axhline(
+        y=true_values[param_to_learn],
+        color="black",
+        linestyle="--",
+        linewidth=2,
+        label=f"True {param_to_learn}"
+    )
+
     plt.xlabel("Time (sec)")
     plt.ylabel(param_to_learn)
     plt.title(f"Convergence of {param_to_learn}")
@@ -490,12 +506,12 @@ def main(param_to_learn):
     plt.grid(True)
     plt.tight_layout()
 
+    # File name: clean, reproducible, paper-friendly
     save_path = f"convergence_{param_to_learn}.png"
     plt.savefig(save_path, dpi=300)
     print(f"Saved parameter convergence plot to: {save_path}")
+
     plt.show()
 
-
-for param in [ "lam"]:
+for param in ["rho","cp","lam"]:
     main(param)
-
