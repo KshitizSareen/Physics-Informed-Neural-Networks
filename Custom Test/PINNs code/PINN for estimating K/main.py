@@ -148,15 +148,14 @@ def train_pinn(model, data, n_epochs=10000):
             best_k_error = k_error
             best_k = model.thermal_conductivity.item()
         
-        if (epoch + 1) % 500 == 0:
-            print(f"Epoch {epoch+1}/{n_epochs}")
-            print(f"  Total Loss: {loss.item():.6e}")
-            print(f"  Interior Loss: {loss_interior.item():.6e}")
-            print(f"  Physics Loss: {loss_physics.item():.6e}")
-            print(f"  k (current): {model.thermal_conductivity.item():.4f}")
-            print(f"  k (best): {best_k:.4f} (error: {best_k_error:.4f})")
-            print(f"  LR_net: {optimizer_net.param_groups[0]['lr']:.2e}, LR_k: {optimizer_k.param_groups[0]['lr']:.2e}")
-            print()
+        print(f"Epoch {epoch+1}/{n_epochs}")
+        print(f"  Total Loss: {loss.item():.6e}")
+        print(f"  Interior Loss: {loss_interior.item():.6e}")
+        print(f"  Physics Loss: {loss_physics.item():.6e}")
+        print(f"  k (current): {model.thermal_conductivity.item():.4f}")
+        print(f"  k (best): {best_k:.4f} (error: {best_k_error:.4f})")
+        print(f"  LR_net: {optimizer_net.param_groups[0]['lr']:.2e}, LR_k: {optimizer_k.param_groups[0]['lr']:.2e}")
+        print()
     
     return history
 
