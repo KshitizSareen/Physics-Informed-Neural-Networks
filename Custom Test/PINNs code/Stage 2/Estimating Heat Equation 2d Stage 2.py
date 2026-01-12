@@ -90,16 +90,21 @@ t_train_Nu = X_train_Nu_tensor[:, 2:3]
 
 
 # --- Boundary points: x = 0 or x = max, y = 0 or y = max ---
-boundary_mask = np.isclose(coords_array[:, 0], 0) | np.isclose(coords_array[:, 0], coords_array[:, 0].max()) | \
-                np.isclose(coords_array[:, 1], 0) | np.isclose(coords_array[:, 1], coords_array[:, 1].max())
+eps = 1e-6
+
+boundary_mask = (
+    np.isclose(coords_array[:, 0], -1.0, atol=eps) | np.isclose(coords_array[:, 0], 1.0, atol=eps) |
+    np.isclose(coords_array[:, 1], -1.0, atol=eps) | np.isclose(coords_array[:, 1], 1.0, atol=eps)
+)
+
+initial_mask = np.isclose(coords_array[:, 2], -1.0, atol=eps)
+
 X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
 U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
 x_train_boundary = X_train_boundary_tensor[:, 0:1]
 y_train_boundary = X_train_boundary_tensor[:, 1:2]
 t_train_boundary = X_train_boundary_tensor[:, 2:3]
 
-# --- Initial points: t = 0 ---
-initial_mask = np.isclose(coords_array[:, 2], 0)
 X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
 U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
 x_train_initial = X_train_initial_tensor[:, 0:1]
@@ -224,9 +229,9 @@ class PINN(nn.Module):
 
         u = self.forward(x, y, t)
 
-        dx_factor = 1.0 / (maxX-minX)
-        dy_factor = 1.0 / (maxY-minY)
-        dt_factor = 1.0 / (maxT-minT)
+        dx_factor = 2.0 / (maxX-minX)
+        dy_factor = 2.0 / (maxY-minY)
+        dt_factor = 2.0 / (maxT-minT)
 
         u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
         u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
@@ -263,8 +268,8 @@ class PINN(nn.Module):
         u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
         u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
 
-        u_x = u_x * (1.0 / (maxX-minX))
-        u_y = u_y * (1.0 / (maxY-minY))
+        u_x = ((maxTemp-minTemp)/2) *  u_x * (2.0 / (maxX-minX))
+        u_y = ((maxTemp-minTemp)/2) * u_y * (2.0 / (maxY-minY))
 
         return torch.mean(u_x ** 2) + torch.mean(u_y ** 2)
 

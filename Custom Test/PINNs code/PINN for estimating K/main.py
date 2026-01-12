@@ -1,7 +1,10 @@
+import pandas as pd
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class PINN(nn.Module):
     """Physics-Informed Neural Network"""
@@ -46,54 +49,36 @@ def compute_physics_loss(model, x, t):
     
     # Heat equation residual
     k = model.thermal_conductivity
-    residual = du_dt - k * d2u_dx2
+    residual = k * SPECIFIC_HEAT_CAPACITY *du_dt - THERMAL_CONDUCTIVITY * d2u_dx2 - Q
     
     return torch.mean(residual**2)
 
-def generate_training_data(n_initial=200, n_boundary=200, n_collocation=5000, n_interior=1000, k_true=10.0):
-    """Generate training data for heat equation with true thermal conductivity k_true"""
-    
-    # Initial condition: t=0, x ∈ [0, 1]
-    x_initial = torch.linspace(0, 1, n_initial).reshape(-1, 1)
-    t_initial = torch.zeros(n_initial, 1)
-    u_initial = torch.sin(np.pi * x_initial)
-    
-    # Boundary conditions: x=0 and x=1, t ∈ [0, 0.5]
-    t_boundary = torch.linspace(0, 0.5, n_boundary//2).reshape(-1, 1)
-    x_boundary_left = torch.zeros(n_boundary//2, 1)
-    x_boundary_right = torch.ones(n_boundary//2, 1)
-    x_boundary = torch.cat([x_boundary_left, x_boundary_right], dim=0)
-    t_boundary_full = torch.cat([t_boundary, t_boundary], dim=0)
-    u_boundary = torch.zeros(n_boundary, 1)
-    
-    # Collocation points for physics loss - focus on region where solution is active
-    x_collocation = torch.rand(n_collocation, 1)
-    t_collocation = torch.rand(n_collocation, 1) * 0.3  # Focus on early times
-    
-    # Dense interior data from analytical solution: u(x,t) = sin(πx)exp(-k*π²*t)
-    # Use a grid for better coverage
-    n_grid = int(np.sqrt(n_interior))
-    x_grid = torch.linspace(0.1, 0.9, n_grid)
-    t_grid = torch.linspace(0.001, 0.2, n_grid)
-    X_grid, T_grid = torch.meshgrid(x_grid, t_grid, indexing='ij')
-    x_interior = X_grid.reshape(-1, 1)
-    t_interior = T_grid.reshape(-1, 1)
-    u_interior = torch.sin(np.pi * x_interior) * torch.exp(-k_true * np.pi**2 * t_interior)
-    
-    return {
-        'initial': (x_initial, t_initial, u_initial),
-        'boundary': (x_boundary, t_boundary_full, u_boundary),
-        'interior': (x_interior, t_interior, u_interior),
-        'collocation': (x_collocation, t_collocation)
-    }
+def loss_bounds(x, t,model):
+    x = x.detach().clone().requires_grad_(True)
+    t = t.detach().clone().requires_grad_(True)
 
-def train_pinn(model, data, n_epochs=10000):
+    u = model.forward(x,  t)
+
+    u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+
+    return torch.mean(u_x ** 2)
+
+def train_pinn(model, minX,maxX,minY,maxY,minT,maxT,minTemp,maxTemp,U_train_Nu,x_train_Nu,y_train_Nu,t_train_Nu,U_train_boundary,x_train_boundary,y_train_boundary,t_train_boundary,U_train_initial,x_train_initial,y_train_initial,t_train_initial, n_epochs=10000):
     """Train the PINN model using Adam optimizer"""
-    
-    x_init, t_init, u_init = data['initial']
-    x_bound, t_bound, u_bound = data['boundary']
-    x_interior, t_interior, u_interior = data['interior']
-    x_coll, t_coll = data['collocation']
+    n_collocation = 1000
+    x_collocation = torch.rand(n_collocation, 1)
+    t_collocation = torch.rand(n_collocation, 1)
+    x_init, t_init, u_init = x_train_initial,t_train_initial,U_train_initial
+    x_bound, t_bound, u_bound = x_train_boundary,t_train_boundary,U_train_boundary
+    x_interior, t_interior, u_interior = x_train_Nu,t_train_Nu,U_train_Nu
+    x_coll, t_coll = x_collocation,t_collocation
+
+    x_init_norm = (x_init - minX)/(maxX-minX)
+    t_init_norm = (t_init - minT)/(maxT-minT)
+
+    x_interior_norm = (x_interior - minX)/(maxX-minX)
+    t_interior_norm = (t_interior - minT)/(maxT-minT)
+
     
     history = {'total': [], 'data': [], 'physics': [], 'interior': [], 'k': []}
     
@@ -113,12 +98,12 @@ def train_pinn(model, data, n_epochs=10000):
         optimizer_k.zero_grad()
         
         # Data loss (initial and boundary conditions)
-        u_init_pred = model(x_init, t_init)
-        u_bound_pred = model(x_bound, t_bound)
-        u_interior_pred = model(x_interior, t_interior)
+
+        u_init_pred = model(x_init_norm, t_init_norm)
+        u_interior_pred = model(x_interior_norm, t_interior_norm)
         
         loss_init = torch.mean((u_init_pred - u_init)**2)
-        loss_bound = torch.mean((u_bound_pred - u_bound)**2)
+        loss_bound = loss_bounds(x_bound,t_bound,model)
         loss_interior = torch.mean((u_interior_pred - u_interior)**2)
         
         # Physics loss
@@ -232,8 +217,98 @@ def plot_results(model, history, true_k=10.0):
     plt.tight_layout()
     plt.show()
 
+# === Constants ===
+DENSITY = 1.68
+SPECIFIC_HEAT_CAPACITY = 0.96
+Q = 2.192
+INITIAL_TEMP = 21.23
+THERMAL_CONDUCTIVITY = 10
+NUM_DIV = 100
+DURATION = 1
+LENGTH = 1
+TIMESTEP = 0.01
+steps = 100000
+
+# Map parameter name → true value
+true_values = {
+    "rho": DENSITY,
+    "cp":  SPECIFIC_HEAT_CAPACITY,
+    "lam": THERMAL_CONDUCTIVITY,
+}
+
+
+def load_data(filepath="temperature_output.csv"):
+    return pd.read_csv(filepath)
+
+# === Prepare Training Data ===
+def prepare_training_data(df):
+    xValues = set()
+    yValues = set()
+    tValues = set()
+    all_columns = df.columns.tolist()
+
+    all_coords = []
+    all_temps = []
+    for idx in range(len(df)):
+        t_raw = df["Timestamp"].iloc[idx]
+        for i in range(2, len(all_columns)):
+            column = all_columns[i]
+            x, y = map(float, column.strip("()").split(","))
+            temp = df.iloc[idx, i]
+
+            
+            xValues.add(x)
+            yValues.add(y)
+            tValues.add(t_raw)
+            all_coords.append([x, y, t_raw])
+            all_temps.append([temp])
+    return (
+        np.array(all_coords),np.array(all_temps)
+    )
+
+
+
 # Main execution
 if __name__ == "__main__":
+    df = load_data() 
+    coords_array, tempValues = prepare_training_data(df)
+
+    minX,maxX = coords_array[:,0].min(),coords_array[:,0].max()
+    minY,maxY = coords_array[:,1].min(),coords_array[:,1].max()
+    minT,maxT = coords_array[:,2].min(),coords_array[:,2].max()
+    minTemp,maxTemp = tempValues.min(),tempValues.max()
+
+    # --- No normalization ---
+
+    # --- All training data ---
+    X_train_Nu_tensor = torch.from_numpy(coords_array).float().to(device)
+    U_train_Nu = torch.from_numpy(tempValues).float().to(device)
+    x_train_Nu = X_train_Nu_tensor[:, 0:1]
+    y_train_Nu = X_train_Nu_tensor[:, 1:2]
+    t_train_Nu = X_train_Nu_tensor[:, 2:3]
+
+
+    # --- Boundary points: x = 0 or x = max, y = 0 or y = max ---
+    eps = 1e-6
+
+    boundary_mask = (
+        np.isclose(coords_array[:, 0], minX, atol=eps) | np.isclose(coords_array[:, 0], maxX, atol=eps) |
+        np.isclose(coords_array[:, 1], minY, atol=eps) | np.isclose(coords_array[:, 1], maxY, atol=eps)
+    )
+
+    initial_mask = np.isclose(coords_array[:, 2], minT, atol=eps)
+
+    X_train_boundary_tensor = torch.from_numpy(coords_array[boundary_mask]).float().to(device)
+    U_train_boundary = torch.from_numpy(tempValues[boundary_mask]).float().to(device)
+    x_train_boundary = X_train_boundary_tensor[:, 0:1]
+    y_train_boundary = X_train_boundary_tensor[:, 1:2]
+    t_train_boundary = X_train_boundary_tensor[:, 2:3]
+
+    X_train_initial_tensor = torch.from_numpy(coords_array[initial_mask]).float().to(device)
+    U_train_initial = torch.from_numpy(tempValues[initial_mask]).float().to(device)
+    x_train_initial = X_train_initial_tensor[:, 0:1]
+    y_train_initial = X_train_initial_tensor[:, 1:2]
+    t_train_initial = X_train_initial_tensor[:, 2:3]
     # Set random seed for reproducibility
     torch.manual_seed(42)
     np.random.seed(42)
@@ -250,26 +325,11 @@ if __name__ == "__main__":
     print(f"Initial k = {model.thermal_conductivity.item():.4f}")
     print()
     
-    # Generate training data with k=10
-    data = generate_training_data(
-        n_initial=200, 
-        n_boundary=200, 
-        n_collocation=5000,
-        n_interior=1024,
-        k_true=10.0
-    )
-    print("Training data generated:")
-    print(f"  Initial conditions: {data['initial'][0].shape[0]} points")
-    print(f"  Boundary conditions: {data['boundary'][0].shape[0]} points")
-    print(f"  Interior data points: {data['interior'][0].shape[0]} points")
-    print(f"  Collocation points: {data['collocation'][0].shape[0]} points")
-    print(f"  True thermal conductivity: k = 10.0")
-    print()
     
     # Train model
     print("Starting training...")
     print()
-    history = train_pinn(model, data, n_epochs=10000)
+    history = train_pinn(model, minX,maxX,minY,maxY,minT,maxT,minTemp,maxTemp,U_train_Nu,x_train_Nu,y_train_Nu,t_train_Nu,U_train_boundary,x_train_boundary,y_train_boundary,t_train_boundary,U_train_initial,x_train_initial,y_train_initial,t_train_initial, n_epochs=20000)
     
     # Final results
     print("=" * 70)
