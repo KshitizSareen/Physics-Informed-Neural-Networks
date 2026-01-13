@@ -47,9 +47,9 @@ def prepare_training_data(df):
 
     all_coords = []
     all_temps = []
-    for idx in range(len(df)):
+    for idx in range(len(df)//2):
         t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(all_columns)):
+        for i in range(2, len(all_columns)//2):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
@@ -437,7 +437,7 @@ def main(param_to_learn):
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,      # Data points
             x_train_initial, y_train_initial, t_train_initial,   # IC points
             x_train_boundary, y_train_boundary, t_train_boundary, # BC points
-            x_coll, y_coll, t_coll                                # Collocation points
+            x_train_Nu, y_train_Nu, t_train_Nu                                # Collocation points
         )
 
         if it % 50 == 0:
@@ -540,7 +540,7 @@ def main(param_to_learn):
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
             x_train_boundary, y_train_boundary, t_train_boundary,
-            x_coll_fixed, y_coll_fixed, t_coll_fixed  # Fixed collocation for L-BFGS
+            x_train_Nu, y_train_Nu, t_train_Nu                                # Collocation points
         )
 
         L = (
@@ -648,5 +648,5 @@ def main(param_to_learn):
     plt.show()
 
 
-for param in ["lam"]:
+for param in ["rho","cp","lam"]:
     main(param)
