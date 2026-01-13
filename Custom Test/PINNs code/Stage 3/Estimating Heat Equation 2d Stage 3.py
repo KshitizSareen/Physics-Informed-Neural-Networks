@@ -35,7 +35,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output_cuda_tiled.csv"):
+def load_data(filepath="temperature_output_seq.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -47,9 +47,9 @@ def prepare_training_data(df):
 
     all_coords = []
     all_temps = []
-    for idx in range(len(df)//2):
+    for idx in range(len(df)):
         t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(all_columns)//2):
+        for i in range(2, len(all_columns)):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
@@ -422,7 +422,7 @@ def main(param_to_learn):
 
     adam_opt = torch.optim.Adam(model.parameters(), lr=1e-2)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        adam_opt, mode='min', factor=0.5, patience=200, min_lr=1e-3
+        adam_opt, mode='min', factor=0.5, patience=200, min_lr=1e-6
     )
 
     for it in range(adam_iters):
@@ -462,50 +462,47 @@ def main(param_to_learn):
         history["lam"].append(float(model.lam.detach()))
         history["time_sec"].append(elapsed)
 
+        pv = get_param_val()
+        history["L_total"].append(curr)
+        history["L_pde"].append(float(Lr.detach()))
+        history["L_ic"].append(float(Li.detach()))
+        history["L_bc"].append(float(Lb.detach()))
+        history["L_data"].append(float(Ld.detach()))
 
+        current_lr = adam_opt.param_groups[0]['lr']
+        print(
+            f"[Adam {it:05d}] L={curr:.3e} "
+            f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+            f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
+            f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
+            f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f}) |"
+            f"Current LR = {current_lr}"
+        )
 
-        if it % log_every == 0 or it == adam_iters - 1:
-            pv = get_param_val()
-            history["L_total"].append(curr)
-            history["L_pde"].append(float(Lr.detach()))
-            history["L_ic"].append(float(Li.detach()))
-            history["L_bc"].append(float(Lb.detach()))
-            history["L_data"].append(float(Ld.detach()))
+        if curr < best_loss - loss_min_delta:
+            best_loss = curr
+            loss_counter = 0
+        else:
+            loss_counter += 1
 
-            current_lr = adam_opt.param_groups[0]['lr']
-            print(
-                f"[Adam {it:05d}] L={curr:.3e} "
-                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
-                f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f}) |"
-                f"Current LR = {current_lr}"
-            )
-
-            if curr < best_loss - loss_min_delta:
-                best_loss = curr
-                loss_counter = 0
+        if prev_param is None:
+            prev_param = pv
+            param_counter = 0
+        else:
+            if abs(pv - prev_param) < param_min_delta:
+                param_counter += 1
             else:
-                loss_counter += 1
-
-            if prev_param is None:
-                prev_param = pv
                 param_counter = 0
-            else:
-                if abs(pv - prev_param) < param_min_delta:
-                    param_counter += 1
-                else:
-                    param_counter = 0
-                prev_param = pv
+            prev_param = pv
 
 
-            if param_counter >= param_patience:
-                print(f"[Adam] Early stopping: {param_to_learn} converged.")
-                break
+        if param_counter >= param_patience:
+            print(f"[Adam] Early stopping: {param_to_learn} converged.")
+            break
 
-            if loss_counter >= loss_patience:
-                print(f"[Adam] Early stopping: loss plateau.")
-                break
+        if loss_counter >= loss_patience:
+            print(f"[Adam] Early stopping: loss plateau.")
+            break
 
     # ---------------------------
     # PHASE 2: L-BFGS refinement
@@ -526,6 +523,10 @@ def main(param_to_learn):
         max_iter=1,
         history_size=100,
         line_search_fn="strong_wolfe"
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        lbfgs_opt, mode='min', factor=0.5, patience=200, min_lr=1e-6
     )
 
     best_loss = float("inf")
@@ -565,61 +566,60 @@ def main(param_to_learn):
 
         L = lbfgs_opt.step(closure)
         curr = float(L.detach())
+        scheduler.step(curr)
 
         elapsed = default_timer() - t_start
         history["rho"].append(float(model.rho.detach()))
         history["cp"].append(float(model.cp.detach()))
         history["lam"].append(float(model.lam.detach()))
         history["time_sec"].append(elapsed)
-
-        if it % log_every == 0 or it == lbfgs_iters - 1:
-            with torch.enable_grad():
-                Lr, Li, Lb, Ld = model.losses(
-                    x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
-                    x_train_initial, y_train_initial, t_train_initial,
-                    x_train_boundary, y_train_boundary, t_train_boundary,
-                    x_coll_fixed, y_coll_fixed, t_coll_fixed
-                )
-
-            pv = get_param_val()
-
-            history["L_total"].append(curr)
-            history["L_pde"].append(float(Lr.detach()))
-            history["L_ic"].append(float(Li.detach()))
-            history["L_bc"].append(float(Lb.detach()))
-            history["L_data"].append(float(Ld.detach()))
-
-            if curr < best_loss - loss_min_delta:
-                best_loss = curr
-                loss_counter = 0
-            else:
-                loss_counter += 1
-
-            if prev_param is None:
-                prev_param = pv
-                param_counter = 0
-            else:
-                if abs(pv - prev_param) < param_min_delta:
-                    param_counter += 1
-                else:
-                    param_counter = 0
-                prev_param = pv
-
-            print(
-                f"[LBFGS {it:05d}] L={curr:.3e} "
-                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
-                f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f})"
+        with torch.enable_grad():
+            Lr, Li, Lb, Ld = model.losses(
+                x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
+                x_train_initial, y_train_initial, t_train_initial,
+                x_train_boundary, y_train_boundary, t_train_boundary,
+                x_coll_fixed, y_coll_fixed, t_coll_fixed
             )
 
-            if param_counter >= param_patience:
-                print(f"[LBFGS] Early stopping: {param_to_learn} converged.")
-                break
+        pv = get_param_val()
 
-            if loss_counter >= loss_patience:
-                print(f"[LBFGS] Early stopping: loss plateau.")
-                break
+        history["L_total"].append(curr)
+        history["L_pde"].append(float(Lr.detach()))
+        history["L_ic"].append(float(Li.detach()))
+        history["L_bc"].append(float(Lb.detach()))
+        history["L_data"].append(float(Ld.detach()))
+
+        if curr < best_loss - loss_min_delta:
+            best_loss = curr
+            loss_counter = 0
+        else:
+            loss_counter += 1
+
+        if prev_param is None:
+            prev_param = pv
+            param_counter = 0
+        else:
+            if abs(pv - prev_param) < param_min_delta:
+                param_counter += 1
+            else:
+                param_counter = 0
+            prev_param = pv
+
+        print(
+            f"[LBFGS {it:05d}] L={curr:.3e} "
+            f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+            f"{param_to_learn}={pv:.6f} p_streak={param_counter}/{param_patience} | "
+            f"best={best_loss:.3e} l_streak={loss_counter}/{loss_patience} | "
+            f"lams=({current_lambdas['pde']:.2f},{current_lambdas['ic']:.2f},{current_lambdas['bc']:.2f},{current_lambdas['data']:.2f})"
+        )
+
+        if param_counter >= param_patience:
+            print(f"[LBFGS] Early stopping: {param_to_learn} converged.")
+            break
+
+        if loss_counter >= loss_patience:
+            print(f"[LBFGS] Early stopping: loss plateau.")
+            break
 
     # ---------------------------
     # Plot + save
