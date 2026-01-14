@@ -35,7 +35,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output.csv"):
+def load_data(filepath="temperature_output copy.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -255,8 +255,10 @@ class PINN(nn.Module):
 
     def loss_initial(self, x, y, t):
         u = self.forward(x, y, t)
+        x_denorm = (((x+1)/2)*(maxX-minX))+minX 
+        y_denorm = (((y+1)/2)*(maxY-minY))+minY 
         u = 0.5 * (u + 1) * (maxTemp-minTemp) + minTemp
-        return torch.mean((u - INITIAL_TEMP) ** 2)
+        return torch.mean((u - (20 + (x_denorm ** 2) + (y_denorm ** 2)))**2)
 
     def loss_bounds(self, x, y, t):
         x = x.detach().clone().requires_grad_(True)
@@ -335,86 +337,12 @@ def main(param_to_learn):
     # Loss early stopping config
     early_stop_patience = 2000
     min_delta = 1e-8
-    check_every = 100
+    check_every = 10
 
     best_loss = float("inf")
     best_state = None
     patience_counter = 0
 
-    for it in range(adam_iters):
-        optimizer.zero_grad()
-
-        Lr, Li, Lb, Ld = model.losses(
-            x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
-            x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
-        )
-
-        L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
-        L.backward()
-        optimizer.step()
-
-        curr = float(L.detach())
-
-        # ----- Loss-based early stopping -----
-        if curr < best_loss - min_delta:
-            best_loss = curr
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += check_every
-
-        # ----- Param-convergence early stopping -----
-        # check if parameter stopped moving
-        param_val = get_learned_scalar_value()
-        if prev_param_val is None:
-            prev_param_val = param_val
-            param_counter = 0
-        else:
-            if abs(param_val - prev_param_val) < param_min_delta:
-                param_counter += 1
-            else:
-                param_counter = 0
-            prev_param_val = param_val
-
-        # ----- Logging -----
-        elapsed = default_timer() - t_start
-        history["rho"].append(float(model.rho.detach()))
-        history["cp"].append(float(model.cp.detach()))
-        history["lam"].append(float(model.lam.detach()))
-        history["time_sec"].append(elapsed)
-
-        # Evaluate periodically (loss ES + param-convergence ES)
-        if (it % check_every == 0) or (it == adam_iters - 1):
-            print(
-                f"[Adam {it:06d}] L={curr:.3e} "
-                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
-                f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
-            )
-
-        # ----- Stop conditions -----
-        if patience_counter >= early_stop_patience:
-            print(f"[Adam] Early stopping (loss) at iter={it} best_loss={best_loss:.3e}")
-            break
-
-        if param_counter >= param_patience:
-            print(
-                f"[Adam] Early stopping (param converged) at iter={it}: "
-                f"{param_to_learn} changed < {param_min_delta:g} for {param_patience} checks "
-                f"({param_patience*check_every} steps)."
-            )
-            break
-
-    # Restore best Adam model before L-BFGS
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        model.to(device)
-
-    # Reset param convergence tracker for LBFGS
-    param_counter = 0
-    prev_param_val = None
 
     # ---------------------------
     # Phase 2: L-BFGS + Early Stopping (loss + param convergence)
