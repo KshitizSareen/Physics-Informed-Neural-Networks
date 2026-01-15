@@ -574,5 +574,5 @@ def main(param_to_learn):
     plt.show()
 
 
-for param in ["lam"]:
+for param in ["rho","cp","lam"]:
     main(param)

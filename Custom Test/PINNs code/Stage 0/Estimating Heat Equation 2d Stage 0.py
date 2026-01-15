@@ -35,7 +35,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output.csv"):
+def load_data(filepath="temperature_output_cuda_tiled.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -47,9 +47,9 @@ def prepare_training_data(df):
 
     all_coords = []
     all_temps = []
-    for idx in range(len(df)):
+    for idx in range(len(df)//4):
         t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(all_columns)):
+        for i in range(2, len(all_columns)//4):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
@@ -210,9 +210,9 @@ class PINN(nn.Module):
         residual = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
         return torch.mean(residual ** 2)
 
-    def loss_initial(self, x, y, t):
+    def loss_initial(self, x, y, t,u_init):
         u = self.forward(x, y, t)
-        return torch.mean((u - INITIAL_TEMP) ** 2)
+        return torch.mean((u - u_init) ** 2)
 
     def loss_bounds(self, x, y, t):
         x = x.requires_grad_(True)
@@ -229,9 +229,9 @@ class PINN(nn.Module):
         u = self.forward(x, y, t)
         return torch.mean((u - u_obs) ** 2)
 
-    def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb):
+    def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb,u_init):
         Lr = self.loss_PDE(x_all, y_all, t_all)
-        Li = self.loss_initial(x0, y0, t0)
+        Li = self.loss_initial(x0, y0, t0,u_init)
         Lb = self.loss_bounds(xb, yb, tb)
         Ld = self.loss_data(x_all, y_all, t_all, u_all)
         return Lr, Li, Lb, Ld
@@ -328,7 +328,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
 
         L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
@@ -372,15 +373,13 @@ def main(param_to_learn):
         history["field_l2"].append(float(field_l2_error(model, x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu)))
         history["time_sec"].append(elapsed)
 
-        # Evaluate periodically (loss ES + param-convergence ES)
-        if (it % check_every == 0) or (it == adam_iters - 1):
-            print(
-                f"[Adam {it:06d}] L={curr:.3e} "
-                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
-                f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
-            )
+        print(
+            f"[Adam {it:06d}] L={curr:.3e} "
+            f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+            f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
+            f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
+            f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
+        )
 
         # ----- Stop conditions -----
         if patience_counter >= early_stop_patience:
@@ -433,7 +432,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
         L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
         L.backward()
@@ -453,7 +453,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
 
         # param convergence (LBFGS)

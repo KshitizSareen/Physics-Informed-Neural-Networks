@@ -132,15 +132,16 @@ def train_pinn(model, minX,maxX,minY,maxY,minT,maxT,minTemp,maxTemp,U_train_Nu,x
         if k_error < best_k_error:
             best_k_error = k_error
             best_k = model.thermal_conductivity.item()
-        
-        print(f"Epoch {epoch+1}/{n_epochs}")
-        print(f"  Total Loss: {loss.item():.6e}")
-        print(f"  Interior Loss: {loss_interior.item():.6e}")
-        print(f"  Physics Loss: {loss_physics.item():.6e}")
-        print(f"  k (current): {model.thermal_conductivity.item():.4f}")
-        print(f"  k (best): {best_k:.4f} (error: {best_k_error:.4f})")
-        print(f"  LR_net: {optimizer_net.param_groups[0]['lr']:.2e}, LR_k: {optimizer_k.param_groups[0]['lr']:.2e}")
-        print()
+
+        if epoch%10==0:
+            print(f"Epoch {epoch+1}/{n_epochs}")
+            print(f"  Total Loss: {loss.item():.6e}")
+            print(f"  Interior Loss: {loss_interior.item():.6e}")
+            print(f"  Physics Loss: {loss_physics.item():.6e}")
+            print(f"  k (current): {model.thermal_conductivity.item():.4f}")
+            print(f"  k (best): {best_k:.4f} (error: {best_k_error:.4f})")
+            print(f"  LR_net: {optimizer_net.param_groups[0]['lr']:.2e}, LR_k: {optimizer_k.param_groups[0]['lr']:.2e}")
+            print()
     
     return history
 
@@ -237,7 +238,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output.csv"):
+def load_data(filepath="temperature_output_cuda_tiled.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -249,9 +250,9 @@ def prepare_training_data(df):
 
     all_coords = []
     all_temps = []
-    for idx in range(len(df)):
+    for idx in range(len(df)//4):
         t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(all_columns)):
+        for i in range(2, len(all_columns)//4):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
