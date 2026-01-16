@@ -35,7 +35,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output.csv"):
+def load_data(filepath="temperature_output copy 2.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -101,10 +101,9 @@ class PINN(nn.Module):
     """
     PINN with exactly ONE trainable physical parameter among: rho, cp, lam.
     The rest are fixed to provided true values.
-
-    Stage 1 reparameterization:
-      rho = exp(rho_hat), cp = exp(cp_hat), lam = exp(lam_hat)
-    so learned parameter is unconstrained but physical parameter stays positive.
+    
+    Uses LOG-PARAMETERIZATION: we learn log(param) and exponentiate to get the actual value.
+    This improves optimization for parameters with different scales and ensures positivity.
 
     learn_param: "rho" | "cp" | "lam" | "none"
     """
@@ -119,11 +118,10 @@ class PINN(nn.Module):
         true_rho=DENSITY,
         true_cp=SPECIFIC_HEAT_CAPACITY,
         true_lam=THERMAL_CONDUCTIVITY,
-        init_ranges=None,  # ranges in PHYSICAL space, e.g. {"rho":(0.5,5.0), ...}
-        eps=1e-12,
+        # optional: random init range for the learned parameter (in original space, not log space)
+        init_ranges=None,  # e.g. {"rho": (0.5,5.0), "cp": (0.1,2.5), "lam": (0.1,50.0)}
     ):
         super().__init__()
-        self.eps = eps
 
         self.learn_param = learn_param.lower().strip()
         if self.learn_param not in {"rho", "cp", "lam", "none"}:
@@ -144,7 +142,7 @@ class PINN(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
-        # --- Defaults for init ranges (PHYSICAL space) ---
+        # --- Defaults for init ranges (in original parameter space) ---
         if init_ranges is None:
             init_ranges = {
                 "rho": (0.5, 5.0),
@@ -152,49 +150,48 @@ class PINN(nn.Module):
                 "lam": (0.1, 50.0),
             }
 
-        # --- Fixed TRUE values as buffers (physical space) ---
-        # We store them as positive scalars.
+        # --- Fixed values as buffers (non-trainable, device-aware) ---
         self.register_buffer("rho_fixed", torch.tensor([float(true_rho)], dtype=torch.float32))
         self.register_buffer("cp_fixed",  torch.tensor([float(true_cp)],  dtype=torch.float32))
         self.register_buffer("lam_fixed", torch.tensor([float(true_lam)], dtype=torch.float32))
 
-        # --- Trainable log-parameters (hat variables). Only one is a Parameter. ---
-        self.rho_hat = None
-        self.cp_hat  = None
-        self.lam_hat = None
+        # --- Create exactly one trainable Parameter in LOG SPACE (or none) ---
+        self.log_rho_param = None
+        self.log_cp_param  = None
+        self.log_lam_param = None
 
         if self.learn_param != "none":
             lo, hi = init_ranges[self.learn_param]
-            # init in physical space, then convert to log-space
-            init_phys = (lo + (hi - lo) * torch.rand(1)).float()
-            init_hat = torch.log(init_phys + self.eps)
+            # Sample uniformly in original space, then convert to log space
+            init_val = lo + (hi - lo) * torch.rand(1)
+            log_init_val = torch.log(init_val).float()
 
             if self.learn_param == "rho":
-                self.rho_hat = nn.Parameter(init_hat)
+                self.log_rho_param = nn.Parameter(log_init_val)
             elif self.learn_param == "cp":
-                self.cp_hat = nn.Parameter(init_hat)
+                self.log_cp_param = nn.Parameter(log_init_val)
             elif self.learn_param == "lam":
-                self.lam_hat = nn.Parameter(init_hat)
+                self.log_lam_param = nn.Parameter(log_init_val)
 
         self.epoch = 0
 
-    # --- Physical parameters (always positive) ---
+    # --- Convenient properties to use in PDE (exponentiate to get actual values) ---
     @property
     def rho(self):
-        if self.rho_hat is not None:
-            return torch.exp(self.rho_hat)
+        if self.log_rho_param is not None:
+            return torch.exp(self.log_rho_param)
         return self.rho_fixed
 
     @property
     def cp(self):
-        if self.cp_hat is not None:
-            return torch.exp(self.cp_hat)
+        if self.log_cp_param is not None:
+            return torch.exp(self.log_cp_param)
         return self.cp_fixed
 
     @property
     def lam(self):
-        if self.lam_hat is not None:
-            return torch.exp(self.lam_hat)
+        if self.log_lam_param is not None:
+            return torch.exp(self.log_lam_param)
         return self.lam_fixed
 
     def forward(self, x, y, t):
@@ -206,10 +203,9 @@ class PINN(nn.Module):
 
     # PDE: rho*cp*u_t - lam*(u_xx + u_yy) - Q = 0
     def loss_PDE(self, x, y, t):
-        # Make sure these are leaf tensors requiring grad (robust for LBFGS)
-        x = x.detach().clone().requires_grad_(True)
-        y = y.detach().clone().requires_grad_(True)
-        t = t.detach().clone().requires_grad_(True)
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        t = t.requires_grad_(True)
 
         u = self.forward(x, y, t)
 
@@ -224,15 +220,14 @@ class PINN(nn.Module):
         residual = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
         return torch.mean(residual ** 2)
 
-    def loss_initial(self, x, y, t):
+    def loss_initial(self, x, y, t, u_init):
         u = self.forward(x, y, t)
-        return torch.mean((u - INITIAL_TEMP) ** 2)
+        return torch.mean((u - u_init) ** 2)
 
     def loss_bounds(self, x, y, t):
-        x = x.detach().clone().requires_grad_(True)
-        y = y.detach().clone().requires_grad_(True)
-        t = t.detach().clone().requires_grad_(True)
-
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        t = t.requires_grad_(True)
         u = self.forward(x, y, t)
 
         u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
@@ -244,12 +239,92 @@ class PINN(nn.Module):
         u = self.forward(x, y, t)
         return torch.mean((u - u_obs) ** 2)
 
-    def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb):
+    def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb, u_init):
         Lr = self.loss_PDE(x_all, y_all, t_all)
-        Li = self.loss_initial(x0, y0, t0)
+        Li = self.loss_initial(x0, y0, t0, u_init)
         Lb = self.loss_bounds(xb, yb, tb)
         Ld = self.loss_data(x_all, y_all, t_all, u_all)
         return Lr, Li, Lb, Ld
+
+    def forward(self, x, y, t):
+        out = torch.cat([x, y, t], dim=-1)
+        for layer in self.layers[:-1]:
+            out = self.activation(layer(out))
+        out = self.layers[-1](out)
+        return out
+
+    # PDE: rho*cp*u_t - lam*(u_xx + u_yy) - Q = 0
+    def loss_PDE(self, x, y, t):
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        t = t.requires_grad_(True)
+
+        u = self.forward(x, y, t)
+
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
+
+        u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+
+        residual = (self.rho * self.cp * u_t) - (self.lam * (u_xx + u_yy)) - Q
+        return torch.mean(residual ** 2)
+
+    def loss_initial(self, x, y, t,u_init):
+        u = self.forward(x, y, t)
+        return torch.mean((u - u_init) ** 2)
+
+    def loss_bounds(self, x, y, t):
+        x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
+        t = t.requires_grad_(True)
+        u = self.forward(x, y, t)
+
+        u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+
+        return torch.mean(u_x ** 2) + torch.mean(u_y ** 2)
+
+    def loss_data(self, x, y, t, u_obs):
+        u = self.forward(x, y, t)
+        return torch.mean((u - u_obs) ** 2)
+
+    def losses(self, x_all, y_all, t_all, u_all, x0, y0, t0, xb, yb, tb,u_init):
+        Lr = self.loss_PDE(x_all, y_all, t_all)
+        Li = self.loss_initial(x0, y0, t0,u_init)
+        Lb = self.loss_bounds(xb, yb, tb)
+        Ld = self.loss_data(x_all, y_all, t_all, u_all)
+        return Lr, Li, Lb, Ld
+    
+# Metrics helpers
+def pde_residual_rmse(model: PINN, x, y, t):
+    # RMSE of residual (not squared mean)
+    x = x.requires_grad_(True)
+    y = y.requires_grad_(True)
+    t = t.requires_grad_(True)
+    u = model.forward(x, y, t)
+
+    u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+    u_y = torch.autograd.grad(u, y, grad_outputs=torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+    u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
+    u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+
+    r = (model.rho * model.cp * u_t) - (model.lam * (u_xx + u_yy)) - Q
+    return torch.sqrt(torch.mean(r ** 2)).detach()
+
+def field_l2_error(model: PINN, x, y, t, u_obs):
+    # L2 relative error on the observed points
+    with torch.no_grad():
+        u_pred = model.forward(x, y, t)
+        num = torch.norm(u_pred - u_obs)
+        den = torch.norm(u_obs) + 1e-12
+        return (num / den).detach()
+
+def rel_err(est, true):
+    return abs(float(est) - float(true)) / (abs(float(true)) + 1e-12)
 
 
 def main(param_to_learn):
@@ -283,6 +358,7 @@ def main(param_to_learn):
     # ---------------------------
     # Stop if the learned parameter changes by less than param_min_delta
     # for param_patience "logging checks" in a row.
+    param_check_every = 100          # same cadence as loss logging
     param_patience = 30              # 30 * 100 = 3000 Adam steps of "no movement"
     param_min_delta = 1e-6           # absolute change threshold in parameter value
     param_counter = 0
@@ -314,7 +390,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
 
         L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
@@ -346,20 +423,25 @@ def main(param_to_learn):
 
         # ----- Logging -----
         elapsed = default_timer() - t_start
+        history["L_total"].append(curr)
+        history["L_pde"].append(float(Lr.detach()))
+        history["L_ic"].append(float(Li.detach()))
+        history["L_bc"].append(float(Lb.detach()))
+        history["L_data"].append(float(Ld.detach()))
         history["rho"].append(float(model.rho.detach()))
         history["cp"].append(float(model.cp.detach()))
         history["lam"].append(float(model.lam.detach()))
+        history["pde_residual_rmse"].append(float(pde_residual_rmse(model, x_train_Nu, y_train_Nu, t_train_Nu)))
+        history["field_l2"].append(float(field_l2_error(model, x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu)))
         history["time_sec"].append(elapsed)
 
-        # Evaluate periodically (loss ES + param-convergence ES)
-        if (it % check_every == 0) or (it == adam_iters - 1):
-            print(
-                f"[Adam {it:06d}] L={curr:.3e} "
-                f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
-                f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
-                f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
-                f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
-            )
+        print(
+            f"[Adam {it:06d}] L={curr:.3e} "
+            f"(Ld={float(Ld):.3e}, Lr={float(Lr):.3e}, Lb={float(Lb):.3e}, Li={float(Li):.3e}) | "
+            f"rho={float(model.rho):.6f} cp={float(model.cp):.6f} lam={float(model.lam):.6f} | "
+            f"{param_to_learn}={param_val:.6f} Δ<{param_min_delta:g}? streak={param_counter}/{param_patience} | "
+            f"best={best_loss:.3e} loss_patience={patience_counter}/{early_stop_patience}"
+        )
 
         # ----- Stop conditions -----
         if patience_counter >= early_stop_patience:
@@ -412,7 +494,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
         L = (lambda_r * Lr) + (lambda_i * Li) + (lambda_b * Lb) + (lambda_d * Ld)
         L.backward()
@@ -432,7 +515,8 @@ def main(param_to_learn):
         Lr, Li, Lb, Ld = model.losses(
             x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu,
             x_train_initial, y_train_initial, t_train_initial,
-            x_train_boundary, y_train_boundary, t_train_boundary
+            x_train_boundary, y_train_boundary, t_train_boundary,
+            U_train_initial
         )
 
         # param convergence (LBFGS)
@@ -448,9 +532,16 @@ def main(param_to_learn):
             lbfgs_prev_param_val = param_val
 
         elapsed = default_timer() - t_start
+        history["L_total"].append(curr)
+        history["L_pde"].append(float(Lr.detach()))
+        history["L_ic"].append(float(Li.detach()))
+        history["L_bc"].append(float(Lb.detach()))
+        history["L_data"].append(float(Ld.detach()))
         history["rho"].append(float(model.rho.detach()))
         history["cp"].append(float(model.cp.detach()))
         history["lam"].append(float(model.lam.detach()))
+        history["pde_residual_rmse"].append(float(pde_residual_rmse(model, x_train_Nu, y_train_Nu, t_train_Nu)))
+        history["field_l2"].append(float(field_l2_error(model, x_train_Nu, y_train_Nu, t_train_Nu, U_train_Nu)))
         history["time_sec"].append(elapsed)
 
         # Logging + param convergence checks
@@ -478,6 +569,9 @@ def main(param_to_learn):
     t_total = default_timer() - t_start
     print(f"Total training time: {t_total/60:.2f} min")
 
+    print("\n=== Stage 0 Report ===")
+    print(f"final field L2 error: {history['field_l2'][-1]:.3e}")
+    print(f"final PDE residual RMSE: {history['pde_residual_rmse'][-1]:.3e}")
     print(f"wall-clock time (sec): {t_total:.2f}")
 
     plt.figure(figsize=(7, 4))
@@ -513,5 +607,5 @@ def main(param_to_learn):
 
     plt.show()
 
-for param in ["rho","cp","lam"]:
+for param in ["rho","lam"]:
     main(param)

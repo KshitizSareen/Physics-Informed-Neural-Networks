@@ -35,7 +35,7 @@ true_values = {
 }
 
 
-def load_data(filepath="temperature_output_cuda_tiled.csv"):
+def load_data(filepath="temperature_output_copy.csv"):
     return pd.read_csv(filepath)
 
 # === Prepare Training Data ===
@@ -47,9 +47,9 @@ def prepare_training_data(df):
 
     all_coords = []
     all_temps = []
-    for idx in range(len(df)//4):
+    for idx in range(len(df)):
         t_raw = df["Timestamp"].iloc[idx]
-        for i in range(2, len(all_columns)//4):
+        for i in range(2, len(all_columns)):
             column = all_columns[i]
             x, y = map(float, column.strip("()").split(","))
             temp = df.iloc[idx, i]
@@ -545,5 +545,5 @@ def main(param_to_learn):
 
     plt.show()
 
-for param in ["rho","cp","lam"]:
+for param in ["rho","lam"]:
     main(param)
